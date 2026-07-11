@@ -14,10 +14,12 @@
  * Payloads:
  *   HELLO      (c->n): [proto_version u8]
  *   HELLO_ACK  (n->c): [proto_version u8][max_payload u32 LE]
- *   LOAD_MODULE(c->n): [.wasm binary]
- *   CALL       (c->n): TBD with the WAMR lifecycle work
- *   RESULT     (n->c): TBD with the WAMR lifecycle work
- *   ERROR      (n->c): [error code u8 (enum wasp_err)]
+ *   LOAD_MODULE(c->n): [.wasm binary]; success ack is an empty RESULT
+ *   UNLOAD_MODULE (c->n): empty; success ack is an empty RESULT
+ *   CALL       (c->n): [name_len u8][name][argc u8][arg u32 LE × argc]
+ *                      v1 calling convention: i32 args/results only
+ *   RESULT     (n->c): [nresults u8][value u32 LE × nresults]
+ *   ERROR      (n->c): [error code u8 (enum wasp_err)][utf8 detail, optional]
  *   PING       (c->n): arbitrary; PONG echoes it back
  */
 #ifndef WASP_PROTOCOL_H_
@@ -51,8 +53,17 @@ enum wasp_err {
 	WASP_ERR_TOO_LARGE = 0x03,
 	WASP_ERR_NO_MEM = 0x04,
 	WASP_ERR_BUSY = 0x05,
-	WASP_ERR_NO_MODULE = 0x06,
+	WASP_ERR_NO_MODULE = 0x06,  /* CALL/UNLOAD with no module loaded */
 	WASP_ERR_INTERNAL = 0x07,
+	WASP_ERR_LOAD_FAILED = 0x08, /* module rejected by WAMR loader/instantiation */
+	WASP_ERR_TRAP = 0x09,        /* module trapped during execution */
+	WASP_ERR_BAD_ARGS = 0x0A,    /* malformed CALL payload or signature mismatch */
+	WASP_ERR_NO_FUNC = 0x0B,     /* export not found in loaded module */
 };
+
+/* v1 calling convention limits (i32 cells only). */
+#define WASP_CALL_MAX_ARGS 8
+#define WASP_CALL_MAX_RESULTS 4
+#define WASP_CALL_MAX_NAME_LEN 63
 
 #endif /* WASP_PROTOCOL_H_ */

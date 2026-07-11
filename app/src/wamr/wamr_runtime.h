@@ -1,6 +1,9 @@
 /*
- * Thin wrapper around the WAMR runtime. Only the executor thread and the
- * agent's lifecycle handlers may call these.
+ * Thin wrapper around the WAMR runtime.
+ *
+ * Everything here runs on the executor thread only — the runtime, the
+ * loaded module, and the exec env are all single-threaded by design
+ * (lifecycle and call requests are serialized through wasp_exec_q).
  */
 #ifndef WASP_WAMR_RUNTIME_H_
 #define WASP_WAMR_RUNTIME_H_
@@ -10,8 +13,5 @@
 
 /* Initialize the WAMR runtime with the static heap pool. */
 int wasp_wamr_init(void);
-
-/* TODO(lifecycle): load/instantiate, unload, call — added with the
- * protocol implementation. */
 
 #endif /* WASP_WAMR_RUNTIME_H_ */

@@ -6,15 +6,28 @@ config WASP_AGENT_PORT
 
 config WASP_WAMR_HEAP_POOL_SIZE
 	int "Static heap pool handed to WAMR (bytes)"
-	default 65536
+	default 90112
 	help
 	  All WASM module memory (module structures, linear memory, exec
-	  stacks) is allocated from this pool. Tune per board in
-	  boards/<board>.conf.
+	  stacks) is allocated from this pool. A standard clang-built module
+	  needs one contiguous 64 KiB WASM page for linear memory plus
+	  runtime overhead, so this must comfortably exceed 64 KiB. Tune per
+	  board in boards/<board>.conf.
 
 config WASP_MAX_MODULE_SIZE
 	int "Maximum accepted .wasm module size (bytes)"
 	default 32768
+
+config WASP_WASM_STACK_SIZE
+	int "WASM execution stack size (bytes, from the WAMR pool)"
+	default 4096
+
+config WASP_WASM_HEAP_SIZE
+	int "Per-module-instance app heap size (bytes)"
+	default 4096
+	help
+	  Backs malloc() inside the WASM module (libc-builtin). Carved from
+	  the module's memory space at instantiation time.
 
 config WASP_NET_THREAD_STACK_SIZE
 	int "Network handler thread stack size"

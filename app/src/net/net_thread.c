@@ -25,6 +25,14 @@ LOG_MODULE_REGISTER(wasp_net, LOG_LEVEL_INF);
 /* How often the serve loop wakes to drain wasp_tx_q while idle. */
 #define SERVE_POLL_MS 50
 
+/* A peer that stalls mid-frame longer than this is dropped, so a broken
+ * coordinator cannot wedge the node's single connection slot. */
+#define SOCK_TIMEOUT_SECONDS 10
+
+/* Bumped on every accept; rx messages are stamped with it and tx
+ * messages carrying a stale generation are discarded unsent. */
+static uint8_t conn_gen;
+
 static struct net_mgmt_event_callback ipv4_cb;
 static K_SEM_DEFINE(ipv4_ready, 0, 1);
 
@@ -168,6 +176,7 @@ static int recv_frame(int sock)
 
 	msg.type = hdr[WASP_FRAME_OFF_TYPE];
 	msg.seq = hdr[WASP_FRAME_OFF_SEQ];
+	msg.conn = conn_gen;
 	len = sys_get_le32(&hdr[WASP_FRAME_OFF_LEN]);
 
 	if (len > CONFIG_WASP_MAX_MODULE_SIZE) {
@@ -209,8 +218,9 @@ static int recv_frame(int sock)
 }
 
 /*
- * Send queued responses to the coordinator. With sock < 0 (no connection)
- * the queue is purged so stale responses never reach the next coordinator.
+ * Send queued responses to the coordinator. Messages stamped with a
+ * stale connection generation (produced for a peer that is already
+ * gone) are discarded unsent; pass sock < 0 to discard everything.
  * Returns 0, or -1 when the connection must be closed.
  */
 static int flush_tx(int sock)
@@ -219,7 +229,10 @@ static int flush_tx(int sock)
 	int rc = 0;
 
 	while (k_msgq_get(&wasp_tx_q, &msg, K_NO_WAIT) == 0) {
-		if (sock >= 0 && rc == 0) {
+		if (msg.conn != conn_gen) {
+			LOG_WRN("discarding stale response type 0x%02x (conn %u, now %u)",
+				msg.type, msg.conn, conn_gen);
+		} else if (sock >= 0 && rc == 0) {
 			rc = send_frame(sock, &msg);
 		}
 		if (msg.payload != NULL) {
@@ -292,6 +305,14 @@ static void net_thread_fn(void *a, void *b, void *c)
 			LOG_ERR("accept() failed: %d", errno);
 			continue;
 		}
+
+		conn_gen++;
+
+		struct zsock_timeval timeout = {.tv_sec = SOCK_TIMEOUT_SECONDS};
+
+		zsock_setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+		zsock_setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
 		LOG_INF("coordinator connected");
 		serve(client);
 		zsock_close(client);
