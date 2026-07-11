@@ -1,0 +1,31 @@
+# West manifest for the wasp workspace.
+#
+# The repo root is the west topdir; everything external is cloned under
+# deps/ (gitignored). Dependencies are pinned to release tags for
+# reproducible builds — bump deliberately.
+manifest:
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+    - name: bytecodealliance
+      url-base: https://github.com/bytecodealliance
+
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.4.1
+      clone-depth: 1
+      import:
+        path-prefix: deps
+        # Only pull the Zephyr modules we actually need. Add the vendor HAL
+        # here when porting wasp to a new MCU family.
+        name-allowlist:
+          - cmsis
+          - cmsis_6
+          - hal_stm32
+
+    - name: wasm-micro-runtime
+      remote: bytecodealliance
+      revision: WAMR-2.4.5
+      clone-depth: 1
+      path: deps/modules/lib/wasm-micro-runtime

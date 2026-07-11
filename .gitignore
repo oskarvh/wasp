@@ -1,0 +1,13 @@
+# west-managed dependencies and workspace metadata
+/deps/
+/.west/
+
+# python virtualenv
+/.venv/
+
+# build output
+/build/
+/app/build/
+
+__pycache__/
+*.pyc

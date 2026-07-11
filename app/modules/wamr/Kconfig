@@ -1,0 +1,8 @@
+# Kconfig glue for the wasm-micro-runtime Zephyr module. WAMR declares
+# `kconfig-ext: True` in its module.yml but ships no Kconfig of its own;
+# app/CMakeLists.txt points ZEPHYR_WASM_MICRO_RUNTIME_KCONFIG here.
+
+config WAMR
+	bool "WebAssembly Micro Runtime (WAMR)"
+	help
+	  Build the WAMR interpreter (vmlib) into the image.

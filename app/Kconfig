@@ -1,0 +1,33 @@
+menu "wasp"
+
+config WASP_AGENT_PORT
+	int "TCP port the agent listens on"
+	default 4242
+
+config WASP_WAMR_HEAP_POOL_SIZE
+	int "Static heap pool handed to WAMR (bytes)"
+	default 65536
+	help
+	  All WASM module memory (module structures, linear memory, exec
+	  stacks) is allocated from this pool. Tune per board in
+	  boards/<board>.conf.
+
+config WASP_MAX_MODULE_SIZE
+	int "Maximum accepted .wasm module size (bytes)"
+	default 32768
+
+config WASP_NET_THREAD_STACK_SIZE
+	int "Network handler thread stack size"
+	default 4096
+
+config WASP_AGENT_THREAD_STACK_SIZE
+	int "Agent thread stack size"
+	default 4096
+
+config WASP_EXEC_THREAD_STACK_SIZE
+	int "WASM executor thread stack size"
+	default 8192
+
+endmenu
+
+source "Kconfig.zephyr"
