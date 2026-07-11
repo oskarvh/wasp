@@ -6,18 +6,24 @@
  * coordinator connection at a time: complete frames from the wire go to
  * wasp_rx_q, responses from wasp_tx_q go back onto the wire.
  *
- * Frame parsing / serialization is business logic and intentionally not
- * implemented yet.
+ * Framing errors are handled here, before the agent ever sees the
+ * message: an unknown magic means the stream is desynchronized and the
+ * connection is dropped; oversized or unallocatable payloads are drained
+ * from the stream and answered with an ERROR frame directly.
  */
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/net_mgmt.h>
 #include <zephyr/net/socket.h>
+#include <zephyr/sys/byteorder.h>
 
 #include "wasp.h"
 
 LOG_MODULE_REGISTER(wasp_net, LOG_LEVEL_INF);
+
+/* How often the serve loop wakes to drain wasp_tx_q while idle. */
+#define SERVE_POLL_MS 50
 
 static struct net_mgmt_event_callback ipv4_cb;
 static K_SEM_DEFINE(ipv4_ready, 0, 1);
@@ -59,21 +65,193 @@ static void wait_for_network(void)
 	k_sem_take(&ipv4_ready, K_FOREVER);
 }
 
-static void serve(int client)
-{
-	uint8_t buf[256];
+/* --- socket helpers -------------------------------------------------- */
 
-	/* TODO(protocol): deframe into struct wasp_msg -> wasp_rx_q, and
-	 * drain wasp_tx_q back to the socket. For now just drop the data so
-	 * the connection plumbing can be exercised. */
-	while (true) {
-		ssize_t n = zsock_recv(client, buf, sizeof(buf), 0);
+/* Receive exactly len bytes. Returns 0, or -1 on error/peer close. */
+static int recv_full(int sock, uint8_t *buf, size_t len)
+{
+	while (len > 0) {
+		ssize_t n = zsock_recv(sock, buf, len, 0);
 
 		if (n <= 0) {
-			LOG_INF("coordinator disconnected (%zd)", n);
+			return -1;
+		}
+		buf += n;
+		len -= n;
+	}
+	return 0;
+}
+
+/* Read and discard len bytes to keep the stream in sync. */
+static int drain_bytes(int sock, uint32_t len)
+{
+	uint8_t scratch[64];
+
+	while (len > 0) {
+		size_t chunk = MIN(len, sizeof(scratch));
+
+		if (recv_full(sock, scratch, chunk) < 0) {
+			return -1;
+		}
+		len -= chunk;
+	}
+	return 0;
+}
+
+static int send_full(int sock, const uint8_t *buf, size_t len)
+{
+	while (len > 0) {
+		ssize_t n = zsock_send(sock, buf, len, 0);
+
+		if (n < 0) {
+			return -1;
+		}
+		buf += n;
+		len -= n;
+	}
+	return 0;
+}
+
+static int send_frame(int sock, const struct wasp_msg *msg)
+{
+	uint8_t hdr[WASP_FRAME_HDR_SIZE];
+
+	hdr[WASP_FRAME_OFF_MAGIC] = WASP_PROTO_MAGIC0;
+	hdr[WASP_FRAME_OFF_MAGIC + 1] = WASP_PROTO_MAGIC1;
+	hdr[WASP_FRAME_OFF_TYPE] = msg->type;
+	hdr[WASP_FRAME_OFF_SEQ] = msg->seq;
+	sys_put_le32(msg->len, &hdr[WASP_FRAME_OFF_LEN]);
+
+	if (send_full(sock, hdr, sizeof(hdr)) < 0) {
+		return -1;
+	}
+	if (msg->len > 0 && send_full(sock, msg->payload, msg->len) < 0) {
+		return -1;
+	}
+	return 0;
+}
+
+static int send_error(int sock, uint8_t seq, uint8_t err)
+{
+	struct wasp_msg msg = {
+		.type = WASP_MSG_ERROR,
+		.seq = seq,
+		.len = 1,
+		.payload = &err,
+	};
+
+	return send_frame(sock, &msg);
+}
+
+/* --- frame rx/tx ------------------------------------------------------ */
+
+/*
+ * Receive one frame and hand it to the agent.
+ * Returns 0 on success (including handled-and-skipped frames), -1 when
+ * the connection must be closed.
+ */
+static int recv_frame(int sock)
+{
+	uint8_t hdr[WASP_FRAME_HDR_SIZE];
+	struct wasp_msg msg = {0};
+	uint32_t len;
+
+	if (recv_full(sock, hdr, sizeof(hdr)) < 0) {
+		return -1;
+	}
+
+	if (hdr[WASP_FRAME_OFF_MAGIC] != WASP_PROTO_MAGIC0 ||
+	    hdr[WASP_FRAME_OFF_MAGIC + 1] != WASP_PROTO_MAGIC1) {
+		LOG_WRN("bad magic %02x%02x, dropping connection", hdr[0], hdr[1]);
+		return -1;
+	}
+
+	msg.type = hdr[WASP_FRAME_OFF_TYPE];
+	msg.seq = hdr[WASP_FRAME_OFF_SEQ];
+	len = sys_get_le32(&hdr[WASP_FRAME_OFF_LEN]);
+
+	if (len > CONFIG_WASP_MAX_MODULE_SIZE) {
+		LOG_WRN("frame type 0x%02x len %u exceeds cap %d", msg.type, len,
+			CONFIG_WASP_MAX_MODULE_SIZE);
+		if (drain_bytes(sock, len) < 0 ||
+		    send_error(sock, msg.seq, WASP_ERR_TOO_LARGE) < 0) {
+			return -1;
+		}
+		return 0;
+	}
+
+	if (len > 0) {
+		msg.payload = k_heap_alloc(&wasp_payload_heap, len, K_MSEC(500));
+		if (msg.payload == NULL) {
+			LOG_WRN("no memory for %u byte payload", len);
+			if (drain_bytes(sock, len) < 0 ||
+			    send_error(sock, msg.seq, WASP_ERR_NO_MEM) < 0) {
+				return -1;
+			}
+			return 0;
+		}
+		if (recv_full(sock, msg.payload, len) < 0) {
+			k_heap_free(&wasp_payload_heap, msg.payload);
+			return -1;
+		}
+		msg.len = len;
+	}
+
+	if (k_msgq_put(&wasp_rx_q, &msg, K_MSEC(500)) != 0) {
+		LOG_WRN("agent queue full, dropping frame type 0x%02x", msg.type);
+		if (msg.payload != NULL) {
+			k_heap_free(&wasp_payload_heap, msg.payload);
+		}
+		return send_error(sock, msg.seq, WASP_ERR_BUSY);
+	}
+
+	return 0;
+}
+
+/*
+ * Send queued responses to the coordinator. With sock < 0 (no connection)
+ * the queue is purged so stale responses never reach the next coordinator.
+ * Returns 0, or -1 when the connection must be closed.
+ */
+static int flush_tx(int sock)
+{
+	struct wasp_msg msg;
+	int rc = 0;
+
+	while (k_msgq_get(&wasp_tx_q, &msg, K_NO_WAIT) == 0) {
+		if (sock >= 0 && rc == 0) {
+			rc = send_frame(sock, &msg);
+		}
+		if (msg.payload != NULL) {
+			k_heap_free(&wasp_payload_heap, msg.payload);
+		}
+	}
+	return rc;
+}
+
+static void serve(int client)
+{
+	struct zsock_pollfd pfd = {
+		.fd = client,
+		.events = ZSOCK_POLLIN,
+	};
+
+	while (true) {
+		int rc = zsock_poll(&pfd, 1, SERVE_POLL_MS);
+
+		if (rc < 0) {
+			LOG_ERR("poll() failed: %d", errno);
 			return;
 		}
-		LOG_INF("received %zd bytes (frame parsing not implemented yet)", n);
+		if (pfd.revents & (ZSOCK_POLLHUP | ZSOCK_POLLERR)) {
+			return;
+		}
+		if ((pfd.revents & ZSOCK_POLLIN) && recv_frame(client) < 0) {
+			return;
+		}
+		if (flush_tx(client) < 0) {
+			return;
+		}
 	}
 }
 
@@ -117,6 +295,8 @@ static void net_thread_fn(void *a, void *b, void *c)
 		LOG_INF("coordinator connected");
 		serve(client);
 		zsock_close(client);
+		flush_tx(-1);
+		LOG_INF("coordinator disconnected");
 	}
 }
 

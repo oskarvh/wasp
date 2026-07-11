@@ -12,18 +12,7 @@
 #include <stdint.h>
 #include <zephyr/kernel.h>
 
-/* Wire protocol frame types (draft — see README.md). */
-enum wasp_msg_type {
-	WASP_MSG_HELLO = 0x01,
-	WASP_MSG_HELLO_ACK = 0x02,
-	WASP_MSG_LOAD_MODULE = 0x03,
-	WASP_MSG_UNLOAD_MODULE = 0x04,
-	WASP_MSG_CALL = 0x05,
-	WASP_MSG_RESULT = 0x06,
-	WASP_MSG_ERROR = 0x07,
-	WASP_MSG_PING = 0x08,
-	WASP_MSG_PONG = 0x09,
-};
+#include "protocol.h"
 
 /*
  * A message passed between threads. The payload is allocated from

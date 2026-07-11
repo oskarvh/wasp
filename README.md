@@ -64,26 +64,34 @@ alongside these.
 5. Agent formats a response frame onto the **tx msgq**; network handler
    writes it to the socket.
 
-### Wire protocol (draft)
+### Wire protocol
 
 Length-prefixed binary frames over a single TCP connection (default port
-`4242`, configurable via Kconfig):
+`4242`, configurable via Kconfig). Canonical definition:
+`app/src/protocol.h`; reference implementation of the coordinator side:
+`tools/wasp_client.py`.
 
 ```
 ┌────────┬────────┬───────────┬─────────────┬───────────┐
-│ magic  │ type   │ seq       │ payload len │ payload   │
+│ "WA"   │ type   │ seq       │ payload len │ payload   │
 │ 2 B    │ 1 B    │ 1 B       │ 4 B LE      │ n B       │
 └────────┴────────┴───────────┴─────────────┴───────────┘
 ```
 
-Initial command set (to be refined together with the coordinator design):
+Responses echo the request's `seq`. Payloads are capped at
+`CONFIG_WASP_MAX_MODULE_SIZE`, advertised in `HELLO_ACK`; oversized frames
+are drained and answered with `ERROR(TOO_LARGE)` without losing stream
+sync. A bad magic means the stream is desynchronized and the node drops
+the connection.
 
-- `HELLO` / `HELLO_ACK` — version + capability exchange
-- `LOAD_MODULE` — payload is a `.wasm` binary; node instantiates it
-- `UNLOAD_MODULE`
-- `CALL` — invoke an exported function with arguments
-- `RESULT` / `ERROR` — node → coordinator
-- `PING` / `PONG` — liveness
+Command set:
+
+- `HELLO` / `HELLO_ACK` — version exchange; ack carries the payload cap
+- `LOAD_MODULE` — payload is a `.wasm` binary; node instantiates it *(not implemented yet)*
+- `UNLOAD_MODULE` *(not implemented yet)*
+- `CALL` — invoke an exported function with arguments *(not implemented yet)*
+- `RESULT` / `ERROR` — node → coordinator; `ERROR` payload is a 1-byte code
+- `PING` / `PONG` — liveness; `PONG` echoes the `PING` payload
 
 ### Memory strategy
 
@@ -110,6 +118,8 @@ wasp/
 ├── deps/                   # west-managed dependencies (NOT committed)
 │   ├── zephyr/
 │   └── modules/            # hal_stm32, cmsis, wasm-micro-runtime, …
+├── tools/
+│   └── wasp_client.py      # protocol test client (embryonic coordinator)
 └── README.md
 ```
 
@@ -168,7 +178,7 @@ stacks.
 - [x] Architecture (this document)
 - [x] Workspace scaffolding: west manifest, Zephyr app skeleton, WAMR integration
 - [x] Thread + queue skeleton (network handler, agent, executor)
-- [ ] Wire protocol implementation
+- [x] Wire protocol implementation (framing, HELLO/PING/ERROR; lifecycle commands answer `ERR_UNSUPPORTED` until the WAMR wiring lands)
 - [ ] WASM module lifecycle (load / call / unload) end to end
 - [ ] Coordinator (separate effort)
 - [ ] More boards
