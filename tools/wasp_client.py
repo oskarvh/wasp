@@ -10,6 +10,9 @@ Usage:
   wasp_client.py <node-ip> load mod.wasm
   wasp_client.py <node-ip> call <func> [i32 args...]
   wasp_client.py <node-ip> unload
+  wasp_client.py discover [--ips]                   # listen for ANNOUNCE broadcasts
+  wasp_client.py <node-ip> identify [seconds]       # strobe the status LED
+  wasp_client.py <node-ip> reboot [--bootsel]       # reboot (BOOTSEL = reflash mode)
 
 Remote memory: this client is also the authoritative memory host. Regions
 registered via WaspNode.register_region() are served to the node while any
@@ -21,6 +24,7 @@ import argparse
 import random
 import socket
 import struct
+import threading
 import time
 
 MAGIC = b"WA"
@@ -36,6 +40,9 @@ RESULT = 0x06
 ERROR = 0x07
 PING = 0x08
 PONG = 0x09
+IDENTIFY = 0x0A
+REBOOT = 0x0B
+ANNOUNCE = 0x0C
 MEM_READ = 0x40
 MEM_DATA = 0x41
 MEM_WRITE = 0x42
@@ -50,6 +57,7 @@ NODE_REQUESTS = {MEM_READ, MEM_WRITE, LOCK, UNLOCK, REGION_INFO}
 
 FEAT_REMOTE_MEM = 0x01
 LOCK_LEASE_S = 5.0
+ANNOUNCE_PORT = 4243
 
 ERR_BAD_ARGS = 0x0A
 ERR_LOCKED = 0x0C
@@ -81,6 +89,39 @@ def pack_ref(region: int, offset: int = 0) -> int:
     return (region << 24) | offset
 
 
+def discover(timeout: float = 6.0, port: int = ANNOUNCE_PORT) -> dict[str, dict]:
+    """Listen for ANNOUNCE broadcasts; returns {ip: node info}.
+
+    Payload (see protocol.h): ['W']['A'][ANNOUNCE][version][features]
+    [tcp port u16 LE][busy u8][board_len u8][board name]. The default
+    timeout covers one full 5 s announce interval.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", port))
+    sock.settimeout(0.5)
+
+    nodes: dict[str, dict] = {}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            data, (ip, _) = sock.recvfrom(512)
+        except socket.timeout:
+            continue
+        if len(data) < 9 or data[:2] != MAGIC or data[2] != ANNOUNCE:
+            continue
+        board_len = data[8]
+        nodes[ip] = {
+            "version": data[3],
+            "features": data[4],
+            "port": struct.unpack_from("<H", data, 5)[0],
+            "busy": bool(data[7]),
+            "board": data[9:9 + board_len].decode(errors="replace"),
+        }
+    sock.close()
+    return nodes
+
+
 def err_name(payload: bytes) -> str:
     """Decode an ERROR payload: [code u8][optional utf8 detail]."""
     if not payload:
@@ -91,14 +132,24 @@ def err_name(payload: bytes) -> str:
 
 
 class WaspNode:
-    def __init__(self, host: str, port: int, timeout: float = 5.0):
+    # Serializes all remote-memory servicing. With one connection this
+    # changes nothing; a multi-node coordinator (threads sharing regions
+    # and locks dicts across WaspNode instances) relies on it — it IS
+    # the "coordinator serializes every access" guarantee.
+    _mem_mutex = threading.Lock()
+
+    def __init__(self, host: str, port: int, timeout: float = 5.0,
+                 lock_owner: str = "node"):
         self.sock = socket.create_connection((host, port), timeout=timeout)
         # Random start so a stale response from a previous connection
         # can't accidentally match our first request's seq.
         self.seq = random.randrange(256)
+        # Lock-holder identity of the node behind this connection; give
+        # each node a distinct name when sharing locks between nodes.
+        self.lock_owner = lock_owner
         # Remote memory served to the node: region_id -> bytearray, and
-        # region_id -> (holder, lease expiry). Holder "node" is the
-        # connected node; tests use other names to simulate rival nodes.
+        # region_id -> (holder, lease expiry). A multi-node coordinator
+        # assigns the same dicts to every WaspNode to share the memory.
         self.regions: dict[int, bytearray] = {}
         self.locks: dict[int, tuple[str, float]] = {}
 
@@ -136,7 +187,8 @@ class WaspNode:
         return None
 
     def _serve_node_req(self, rtype: int, rseq: int, payload: bytes):
-        resp_type, resp = self._node_response(rtype, payload)
+        with WaspNode._mem_mutex:
+            resp_type, resp = self._node_response(rtype, payload)
         self.sock.sendall(HDR.pack(MAGIC, resp_type, rseq, len(resp)) + resp)
 
     def _node_response(self, rtype: int, p: bytes) -> tuple[int, bytes]:
@@ -153,11 +205,12 @@ class WaspNode:
                 return REGION_DESC, struct.pack("<I", len(self.regions[region]))
             holder = self._lock_holder(region)
             if rtype == LOCK:
-                if holder not in (None, "node"):
+                if holder not in (None, self.lock_owner):
                     return error(ERR_LOCKED)
-                self.locks[region] = ("node", time.monotonic() + LOCK_LEASE_S)
+                self.locks[region] = (self.lock_owner,
+                                      time.monotonic() + LOCK_LEASE_S)
                 return LOCK_GRANT, struct.pack("<I", int(LOCK_LEASE_S * 1000))
-            if holder != "node":  # UNLOCK
+            if holder != self.lock_owner:  # UNLOCK
                 return error(ERR_BAD_ARGS, "not lock holder")
             del self.locks[region]
             return MEM_ACK, b""
@@ -169,7 +222,7 @@ class WaspNode:
         region, offset = ref >> 24, ref & 0xFFFFFF
         if region not in self.regions:
             return error(ERR_NO_REGION)
-        if self._lock_holder(region) not in (None, "node"):
+        if self._lock_holder(region) not in (None, self.lock_owner):
             return error(ERR_LOCKED)
         buf = self.regions[region]
         if rtype == MEM_READ:
@@ -358,10 +411,63 @@ def cmd_call(node: WaspNode, args):
     print(f"{args.func}({', '.join(args.args)}) -> {results}")
 
 
+def cmd_identify(node: WaspNode, args):
+    node.hello()
+    payload = bytes([args.seconds]) if args.seconds is not None else b""
+    rtype, _, p = node.request(IDENTIFY, payload)
+    if rtype != RESULT:
+        raise RuntimeError(f"identify failed: {err_name(p)}")
+    print(f"LED strobing for {args.seconds or 10} s — go find it")
+
+
+def cmd_reboot(node: WaspNode, args):
+    node.hello()
+    mode = 1 if args.bootsel else 0
+    try:
+        rtype, _, p = node.request(REBOOT, bytes([mode]))
+    except (socket.timeout, ConnectionError, OSError):
+        # The node may drop the link while (or instead of) acking.
+        print("no reply — node presumably rebooting")
+        return
+    if rtype != RESULT:
+        raise RuntimeError(f"reboot refused: {err_name(p)}")
+    print("rebooting into USB bootloader (BOOTSEL)" if mode else "rebooting")
+
+
+def cmd_discover(argv):
+    ap = argparse.ArgumentParser(prog="wasp_client.py discover",
+                                 description="listen for node ANNOUNCE broadcasts")
+    ap.add_argument("--timeout", type=float, default=6.0,
+                    help="listen duration in seconds (default 6, one announce interval)")
+    ap.add_argument("--port", type=int, default=ANNOUNCE_PORT)
+    ap.add_argument("--ips", action="store_true",
+                    help="print space-separated IPs only (for scripting)")
+    args = ap.parse_args(argv)
+
+    nodes = discover(args.timeout, args.port)
+    if args.ips:
+        print(" ".join(sorted(nodes)))
+        return
+    if not nodes:
+        print(f"no nodes heard in {args.timeout:g} s")
+        return
+    for ip in sorted(nodes):
+        n = nodes[ip]
+        print(f"{ip}:{n['port']}  v{n['version']}  features=0x{n['features']:02x}  "
+              f"{'busy' if n['busy'] else 'free'}  {n['board']}")
+
+
 def main():
+    import sys
+
+    # discover has no host argument — handle it before normal parsing.
+    if len(sys.argv) > 1 and sys.argv[1] == "discover":
+        cmd_discover(sys.argv[2:])
+        return
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("host", help="node IP address")
+    ap.add_argument("host", help="node IP address (or 'discover' to find nodes)")
     ap.add_argument("--port", type=int, default=4242)
     sub = ap.add_subparsers(dest="cmd")
 
@@ -376,13 +482,20 @@ def main():
     p = sub.add_parser("call", help="call an exported i32 function")
     p.add_argument("func")
     p.add_argument("args", nargs="*", help="i32 arguments")
+    p = sub.add_parser("identify", help="strobe the node's status LED")
+    p.add_argument("seconds", nargs="?", type=int, default=None,
+                   help="strobe duration (node default 10)")
+    p = sub.add_parser("reboot", help="reboot the node")
+    p.add_argument("--bootsel", action="store_true",
+                   help="enter USB bootloader for reflashing (RP2040 only)")
 
     args = ap.parse_args()
     node = WaspNode(args.host, args.port)
     print(f"connected to {args.host}:{args.port}")
 
     handlers = {"check": cmd_check, "lifecycle": cmd_lifecycle, "remote": cmd_remote,
-                "load": cmd_load, "unload": cmd_unload, "call": cmd_call, None: cmd_check}
+                "load": cmd_load, "unload": cmd_unload, "call": cmd_call,
+                "identify": cmd_identify, "reboot": cmd_reboot, None: cmd_check}
     handlers[args.cmd](node, args)
 
 

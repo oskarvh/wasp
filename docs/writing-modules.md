@@ -83,12 +83,25 @@ $ ls -l gcd.wasm
 
 ## Step 3 — find your node
 
-The node prints its DHCP address on the serial console (115200 baud) at
-boot, and it answers on TCP port 4242:
+Nodes announce themselves over UDP broadcast every 5 seconds, so no
+serial cable is needed — just listen:
 
 ```sh
-picocom -b 115200 /dev/ttyACM0        # …wasp_net: IPv4 address: 10.0.0.154
+$ python3 tools/wasp_client.py discover
+10.0.0.154:4242  v1  features=0x01  free  nucleo_f439zi/stm32f439xx
+10.0.0.181:4242  v1  features=0x01  free  rpi_pico/rp2040/w
 ```
+
+`free`/`busy` tells you whether a coordinator is already connected. With
+several identical boards on the bench, strobe one's status LED to see
+which is which:
+
+```sh
+python3 tools/wasp_client.py 10.0.0.181 identify   # LED strobes for 10 s
+```
+
+(Fallback: the node also prints its DHCP address on the serial console,
+115200 baud, at boot — `picocom -b 115200 /dev/ttyACM0`.)
 
 Sanity-check the connection first:
 

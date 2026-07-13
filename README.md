@@ -99,6 +99,11 @@ Command set:
 - `ERROR` — `[code u8][optional utf8 detail]`, e.g. `TRAP(wasm operand
   stack overflow)`; codes in `app/src/protocol.h`
 - `PING` / `PONG` — liveness; `PONG` echoes the `PING` payload
+- `IDENTIFY` — strobes the status LED (default 10 s) so a human can find
+  the physical board: `wasp_client.py <ip> identify [seconds]`
+- `REBOOT` — remote reboot; mode 1 enters the USB bootloader (RP2040
+  only), so Pico Ws can be reflashed without touching BOOTSEL:
+  `wasp_client.py <ip> reboot [--bootsel]`
 - `MEM_READ` / `MEM_WRITE` / `LOCK` / `UNLOCK` / `REGION_INFO` (0x4x) —
   **node-initiated** remote-memory requests, sent mid-`CALL` in the
   node's own seq space and answered by the coordinator; see
@@ -107,6 +112,30 @@ Command set:
 A module that traps (e.g. `unreachable`, out-of-bounds access) returns
 `ERROR(TRAP, exception-text)` and the node carries on — the WASM sandbox
 holds, and the next `CALL` works.
+
+### Discovery & status LED
+
+Nodes don't need to be known in advance: once online, every node
+broadcasts an `ANNOUNCE` datagram to UDP port `4243` every 5 seconds
+(both Kconfig-tunable) carrying its protocol version, feature bits, TCP
+port, busy flag (coordinator currently connected) and board name.
+
+```
+python3 tools/wasp_client.py discover            # human-readable list
+python3 tools/wasp_client.py discover --ips      # for scripting
+python3 tools/swarm_test.py tools/remote_module.wasm discover
+```
+
+Boards with an `led0` devicetree alias (the Nucleo's green LED, the Pico
+W's WiFi-chip LED — wired up in the app overlay) show their state at a
+glance:
+
+| Pattern | Meaning |
+| --- | --- |
+| fast blink (5 Hz) | no network yet (WiFi joining / DHCP) |
+| heartbeat (short blip every second) | online, waiting for a coordinator |
+| solid on | coordinator connected |
+| frantic strobe (10 Hz) | `IDENTIFY` received — "here I am" |
 
 ### Memory strategy
 
@@ -134,8 +163,9 @@ wasp/
 │   │   └── nucleo_f439zi.conf
 │   └── src/
 │       ├── main.c          # boot, queue setup, thread start
+│       ├── led.c           # status LED thread (patterns + IDENTIFY strobe)
 │       ├── rpc.c           # node->coordinator RPC slot (remote memory)
-│       ├── net/            # network handler thread + framing
+│       ├── net/            # network handler thread + framing + ANNOUNCE broadcast
 │       ├── agent/          # agent thread + protocol dispatch
 │       └── wamr/           # WAMR wrapper + executor + wasp.* host functions
 ├── deps/                   # west-managed dependencies (NOT committed)
@@ -145,6 +175,7 @@ wasp/
 │   └── writing-modules.md  # C function -> node -> result, step by step
 ├── tools/
 │   ├── wasp_client.py      # test client + remote-memory host (embryonic coordinator)
+│   ├── swarm_test.py       # multi-node concurrency test (race + locks + distributed sum)
 │   ├── include/wasp/remote.h  # module-side remote memory API
 │   ├── test_module.c       # test WASM module (add/fib/boom)
 │   ├── remote_module.c     # remote-memory test module
@@ -208,15 +239,31 @@ west build -b rpi_pico/rp2040/w app -d build/pico
 west flash -d build/pico -r uf2                 # board must be in BOOTSEL mode
 ```
 
-Talking to a node (IP is on the serial console, 115200 baud):
+The BOOTSEL-button dance (hold it while plugging in) is only needed the
+**first** time a Pico is flashed with wasp. From then on, reflash over
+the network:
 
 ```sh
+python3 tools/wasp_client.py <node-ip> reboot --bootsel   # RP2040 only
+# ...the RPI-RP2 drive enumerates over USB; mount it and copy the image:
+cp build/pico/zephyr/zephyr.uf2 /media/$USER/RPI-RP2/
+# node reboots into the new firmware and rejoins the network in ~20 s
+```
+
+Talking to a node — no serial cable needed, nodes announce themselves
+over UDP broadcast (see
+[Discovery & status LED](#discovery--status-led)):
+
+```sh
+python3 tools/wasp_client.py discover               # list nodes on the LAN
+python3 tools/wasp_client.py <node-ip> identify     # strobe LED: which board is this?
 python3 tools/wasp_client.py <node-ip> check        # protocol self-test
 tools/build_test_module.sh                          # needs clang + wasm-ld
 python3 tools/wasp_client.py <node-ip> lifecycle tools/test_module.wasm
 python3 tools/wasp_client.py <node-ip> load tools/test_module.wasm
 python3 tools/wasp_client.py <node-ip> call fib 20
 python3 tools/wasp_client.py <node-ip> unload
+python3 tools/wasp_client.py <node-ip> reboot       # remote reboot (any board)
 ```
 
 WASM modules for wasp are plain clang output — no SDK required:
@@ -384,7 +431,13 @@ Phase 1 — explicit remote memory, end to end (**implemented**):
       read-modify-write, fail-fast `LOCKED` for reads/writes/locks
       while a rival holds the lease, lease expiry revocation,
       out-of-bounds rejection, RPC timeout → `TRAP` with node survival.
-      (A true two-node lost-update demo needs a second board.)
+- [x] Swarm test (`tools/swarm_test.py <module> <ip> <ip> ...`, or
+      `... discover` to use ANNOUNCE broadcasts): drives N nodes
+      concurrently against one shared coordinator memory —
+      distributed sum sliced across the swarm (exact), unlocked
+      read-modify-write from all nodes **loses updates** (~55–65% lost
+      with 5–6 real nodes racing), the same workload under `wasp_lock`
+      is exact. The concurrency story is proven on hardware.
 
 Phase 2 — ergonomics:
 
@@ -431,5 +484,10 @@ Phase 4 — research:
       phases 2–4 (typed transparency, caching, un-annotated code) planned
 - [x] Second board: Raspberry Pi Pico W (RP2040 + CYW43439 WiFi) — full
       suite passing on Ethernet and WiFi nodes simultaneously
+- [x] 6-node swarm (1× Nucleo + 5× Pico W): distributed sum, cross-node
+      lost-update race demonstrated, lock exactness under contention
+- [x] Fleet ergonomics: status LED, UDP `ANNOUNCE` discovery, `IDENTIFY`
+      LED strobe, remote `REBOOT` (incl. RP2040 USB-bootloader entry for
+      cable-free reflashing)
 - [ ] Coordinator (separate effort)
 - [ ] More boards

@@ -16,8 +16,10 @@ project(wasp LANGUAGES C)
 
 target_sources(app PRIVATE
   src/main.c
+  src/led.c
   src/rpc.c
   src/net/net_thread.c
+  src/net/announce.c
   src/agent/agent_thread.c
   src/wamr/wamr_runtime.c
   src/wamr/native_remote.c

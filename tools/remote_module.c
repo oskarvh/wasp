@@ -67,6 +67,22 @@ EXPORT("try_write") int try_write(unsigned ref, int val)
 	return wasp_mem_write(ref, &val, sizeof(val));
 }
 
+/* UNLOCKED read-modify-write — deliberately racy. Two nodes running
+ * this concurrently WILL lose updates; that is the point (see the
+ * swarm test). Returns the new value it wrote, or a negative error. */
+EXPORT("racy_add") int racy_add(unsigned ref, int delta)
+{
+	int v;
+	int rc = wasp_mem_read(ref, &v, sizeof(v));
+
+	if (rc != WASP_REMOTE_OK) {
+		return rc;
+	}
+	v += delta;
+	rc = wasp_mem_write(ref, &v, sizeof(v));
+	return rc == WASP_REMOTE_OK ? v : rc;
+}
+
 /* Locked read-modify-write: the reason explicit locks exist. Returns
  * the new counter value, or a negative WASP_REMOTE_* error. */
 EXPORT("locked_add") int locked_add(unsigned region, unsigned ref, int delta)

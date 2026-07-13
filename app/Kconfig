@@ -49,6 +49,22 @@ config WASP_RPC_TIMEOUT_MS
 	  answer a MEM_READ/MEM_WRITE/LOCK/... request before giving up and
 	  raising a WASM exception on the calling module.
 
+config WASP_STATUS_LED
+	bool "Drive a status LED (needs an led0 devicetree alias)"
+	default y
+	help
+	  Blink patterns show network state at a glance; the IDENTIFY
+	  command strobes it so a specific board can be located. No-op on
+	  boards without an led0 alias.
+
+config WASP_ANNOUNCE_PORT
+	int "UDP port for discovery broadcasts"
+	default 4243
+
+config WASP_ANNOUNCE_INTERVAL
+	int "Seconds between ANNOUNCE broadcasts"
+	default 5
+
 config WASP_NET_THREAD_STACK_SIZE
 	int "Network handler thread stack size"
 	default 4096

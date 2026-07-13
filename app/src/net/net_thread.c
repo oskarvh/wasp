@@ -24,9 +24,13 @@
 #include <zephyr/net/wifi_mgmt.h>
 #endif
 
+#include "led.h"
 #include "wasp.h"
 
 LOG_MODULE_REGISTER(wasp_net, LOG_LEVEL_INF);
+
+K_SEM_DEFINE(wasp_net_ready, 0, 1);
+atomic_t wasp_node_busy;
 
 /* How often the serve loop wakes to drain wasp_tx_q while idle. */
 #define SERVE_POLL_MS 50
@@ -342,7 +346,10 @@ static void net_thread_fn(void *a, void *b, void *c)
 	ARG_UNUSED(b);
 	ARG_UNUSED(c);
 
+	wasp_led_set(WASP_LED_NET_DOWN);
 	wait_for_network();
+	wasp_led_set(WASP_LED_READY);
+	k_sem_give(&wasp_net_ready);
 
 	int server = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
@@ -381,11 +388,17 @@ static void net_thread_fn(void *a, void *b, void *c)
 		zsock_setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 		zsock_setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
+		atomic_set(&wasp_node_busy, 1);
+		wasp_led_set(WASP_LED_CONNECTED);
+
 		LOG_INF("coordinator connected");
 		serve(client);
 		zsock_close(client);
 		flush_tx(-1);
 		LOG_INF("coordinator disconnected");
+
+		atomic_set(&wasp_node_busy, 0);
+		wasp_led_set(WASP_LED_READY);
 	}
 }
 

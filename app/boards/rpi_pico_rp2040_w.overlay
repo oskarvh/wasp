@@ -3,6 +3,20 @@
 	chosen {
 		zephyr,console = &wasp_cdc_acm_console;
 	};
+
+	/* The board DTS defines no LED: the Pico W LED sits on the CYW43439
+	 * WiFi chip (WL_GPIO0), reached through the cyw43_gpio controller. */
+	leds {
+		compatible = "gpio-leds";
+		wasp_status_led: wasp_status_led {
+			gpios = <&cyw43_gpio 0 GPIO_ACTIVE_HIGH>;
+			label = "Status LED";
+		};
+	};
+
+	aliases {
+		led0 = &wasp_status_led;
+	};
 };
 
 &zephyr_udc0 {

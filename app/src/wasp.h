@@ -35,6 +35,14 @@ struct wasp_msg {
 
 extern struct k_heap wasp_payload_heap;
 
+/* Given by the net thread once the interface has an address; the
+ * announce thread waits on it before broadcasting. */
+extern struct k_sem wasp_net_ready;
+
+/* Nonzero while a coordinator connection is live (mirrored into the
+ * ANNOUNCE busy byte). Owned by the net thread. */
+extern atomic_t wasp_node_busy;
+
 extern struct k_msgq wasp_rx_q;   /* net -> agent: commands from coordinator */
 extern struct k_msgq wasp_tx_q;   /* agent/executor -> net: responses to coordinator */
 extern struct k_msgq wasp_exec_q; /* agent -> executor: lifecycle + call requests */

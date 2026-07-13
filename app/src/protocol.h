@@ -21,6 +21,18 @@
  *   RESULT     (n->c): [nresults u8][value u32 LE × nresults]
  *   ERROR      (n->c): [error code u8 (enum wasp_err)][utf8 detail, optional]
  *   PING       (c->n): arbitrary; PONG echoes it back
+ *   IDENTIFY   (c->n): [duration_s u8, optional (default 10)]; strobes the
+ *                      status LED so a human can find the board; ack RESULT
+ *   REBOOT     (c->n): [mode u8, optional: 0=reboot (default),
+ *                      1=USB bootloader (RP2040 only, for reflashing)];
+ *                      acks RESULT, then reboots ~500 ms later
+ *
+ * Discovery: nodes broadcast an ANNOUNCE datagram to UDP port
+ * CONFIG_WASP_ANNOUNCE_PORT every CONFIG_WASP_ANNOUNCE_INTERVAL seconds
+ * (not wire-framed — it IS the payload, source IP identifies the node):
+ *
+ *   ['W']['A'][ANNOUNCE u8][version u8][features u8][tcp port u16 LE]
+ *   [busy u8: coordinator currently connected][board_len u8][board name]
  *
  * Remote memory (feature bit WASP_FEAT_REMOTE_MEM): the 0x4x range is
  * node-initiated — sent by the node mid-CALL, answered by the
@@ -63,6 +75,9 @@ enum wasp_msg_type {
 	WASP_MSG_ERROR = 0x07,
 	WASP_MSG_PING = 0x08,
 	WASP_MSG_PONG = 0x09,
+	WASP_MSG_IDENTIFY = 0x0A, /* strobe the status LED to locate the board */
+	WASP_MSG_REBOOT = 0x0B,   /* reboot the node (optionally into its bootloader) */
+	WASP_MSG_ANNOUNCE = 0x0C, /* UDP broadcast datagram, never on the TCP stream */
 
 	/* 0x4x: node-initiated remote-memory traffic (node's seq space). */
 	WASP_MSG_MEM_READ = 0x40,

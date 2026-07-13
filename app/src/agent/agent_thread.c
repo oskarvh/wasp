@@ -9,7 +9,13 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/reboot.h>
 
+#ifdef CONFIG_SOC_RP2040
+#include <pico/bootrom.h>
+#endif
+
+#include "led.h"
 #include "wasp.h"
 
 LOG_MODULE_REGISTER(wasp_agent, LOG_LEVEL_INF);
@@ -30,6 +36,30 @@ static void handle_hello(const struct wasp_msg *msg)
 	LOG_INF("coordinator handshake complete");
 }
 
+static void handle_reboot(const struct wasp_msg *msg)
+{
+	uint8_t mode = msg->len >= 1 ? msg->payload[0] : 0;
+
+#ifndef CONFIG_SOC_RP2040
+	if (mode == 1) {
+		wasp_queue_error(msg, WASP_ERR_UNSUPPORTED, "no bootloader entry on this SoC");
+		return;
+	}
+#endif
+
+	LOG_INF("rebooting%s on coordinator request", mode == 1 ? " into USB bootloader" : "");
+	wasp_queue_tx(msg, WASP_MSG_RESULT, NULL, 0);
+	/* Let the net thread flush the RESULT before we pull the plug. */
+	k_sleep(K_MSEC(500));
+
+#ifdef CONFIG_SOC_RP2040
+	if (mode == 1) {
+		reset_usb_boot(0, 0);
+	}
+#endif
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
 static void handle_msg(struct wasp_msg *msg)
 {
 	switch (msg->type) {
@@ -38,6 +68,13 @@ static void handle_msg(struct wasp_msg *msg)
 		break;
 	case WASP_MSG_PING:
 		wasp_queue_tx(msg, WASP_MSG_PONG, msg->payload, msg->len);
+		break;
+	case WASP_MSG_IDENTIFY:
+		wasp_led_identify((msg->len >= 1 ? msg->payload[0] : 10) * 1000);
+		wasp_queue_tx(msg, WASP_MSG_RESULT, NULL, 0);
+		break;
+	case WASP_MSG_REBOOT:
+		handle_reboot(msg);
 		break;
 	case WASP_MSG_LOAD_MODULE:
 	case WASP_MSG_UNLOAD_MODULE:
