@@ -9,5 +9,11 @@
 /build/
 /app/build/
 
+# local WiFi credentials — never committed
+/app/wifi_credentials.conf
+
+# compiled test modules
+/tools/*.wasm
+
 __pycache__/
 *.pyc

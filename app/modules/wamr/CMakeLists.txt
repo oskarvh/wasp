@@ -14,7 +14,10 @@ set(WAMR_BUILD_PLATFORM "zephyr")
 # Pick the WAMR target from the Zephyr CPU/FPU configuration so new boards
 # work without touching this file.
 if(CONFIG_CPU_CORTEX_M)
-  if(CONFIG_FPU AND CONFIG_FP_HARDABI)
+  if(CONFIG_ARMV6_M_ARMV8_M_BASELINE)
+    # Cortex-M0/M0+/M1 (e.g. RP2040): generic soft-float thumb target.
+    set(WAMR_BUILD_TARGET "THUMB")
+  elseif(CONFIG_FPU AND CONFIG_FP_HARDABI)
     set(WAMR_BUILD_TARGET "THUMBV7EM_VFP")
   else()
     set(WAMR_BUILD_TARGET "THUMBV7EM")

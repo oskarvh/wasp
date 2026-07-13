@@ -23,6 +23,8 @@ manifest:
           - cmsis
           - cmsis_6
           - hal_stm32
+          - hal_rpi_pico  # RP2040 (Raspberry Pi Pico W)
+          - hal_infineon  # CYW43439 WiFi on the Pico W
 
     - name: wasm-micro-runtime
       remote: bytecodealliance

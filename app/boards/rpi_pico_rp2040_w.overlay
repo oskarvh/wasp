@@ -1,0 +1,12 @@
+/* Console on USB CDC ACM — the Pico W exposes no UART over its USB port. */
+/ {
+	chosen {
+		zephyr,console = &wasp_cdc_acm_console;
+	};
+};
+
+&zephyr_udc0 {
+	wasp_cdc_acm_console: wasp_cdc_acm_console {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

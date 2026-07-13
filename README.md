@@ -168,9 +168,15 @@ handled by the Zephyr layers:
 - **New MCU support** = add a board conf/overlay (and a HAL module to the
   manifest allowlist if it's a new vendor). No source changes.
 
-First target: **ST Nucleo-F439ZI** (`nucleo_f439zi`) — Cortex-M4F @ 180 MHz,
-192 KiB SRAM + 64 KiB CCM, on-board Ethernet (LAN8742 PHY), which makes it a
-convenient first swarm node.
+Supported boards:
+
+- **ST Nucleo-F439ZI** (`nucleo_f439zi`) — Cortex-M4F @ 180 MHz, 192 KiB
+  SRAM + 64 KiB CCM, on-board Ethernet (LAN8742 PHY).
+- **Raspberry Pi Pico W** (`rpi_pico/rp2040/w`) — Cortex-M0+ @ 133 MHz,
+  264 KiB SRAM, CYW43439 WiFi (Infineon AIROC driver; needs a one-time
+  `west blobs fetch hal_infineon` and WiFi credentials, see
+  [Building](#building)). Console is USB CDC-ACM. WAMR runs the generic
+  soft-float `THUMB` target on ARMv6-M.
 
 ## Building
 
@@ -189,9 +195,17 @@ pip install -r deps/zephyr/scripts/requirements-base.txt
 export ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb
 export GNUARMEMB_TOOLCHAIN_PATH=/usr   # prefix of arm-none-eabi-gcc
 
-# build & flash
+# build & flash — Nucleo-F439ZI (Ethernet)
 west build -b nucleo_f439zi app
 west flash                 # needs stlink (openocd or STM32CubeProgrammer)
+
+# build & flash — Raspberry Pi Pico W (WiFi)
+west blobs fetch hal_infineon                   # one-time: CYW43439 firmware
+cp app/wifi_credentials.conf.example app/wifi_credentials.conf
+#   ...then edit app/wifi_credentials.conf with your SSID/PSK. The file is
+#   gitignored and merged into the build automatically whenever it exists.
+west build -b rpi_pico/rp2040/w app -d build/pico
+west flash -d build/pico -r uf2                 # board must be in BOOTSEL mode
 ```
 
 Talking to a node (IP is on the serial console, 115200 baud):
@@ -415,5 +429,7 @@ Phase 4 — research:
       `wasp.*` host functions (see
       [Remote memory — design plan](#remote-memory--design-plan));
       phases 2–4 (typed transparency, caching, un-annotated code) planned
+- [x] Second board: Raspberry Pi Pico W (RP2040 + CYW43439 WiFi) — full
+      suite passing on Ethernet and WiFi nodes simultaneously
 - [ ] Coordinator (separate effort)
 - [ ] More boards

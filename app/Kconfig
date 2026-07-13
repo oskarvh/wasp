@@ -29,6 +29,18 @@ config WASP_WASM_HEAP_SIZE
 	  Backs malloc() inside the WASM module (libc-builtin). Carved from
 	  the module's memory space at instantiation time.
 
+config WASP_WIFI_SSID
+	string "WiFi SSID (boards with WiFi only)"
+	default ""
+	help
+	  Network the node joins before starting DHCP. Do NOT put real
+	  credentials in committed files: create app/wifi_credentials.conf
+	  (gitignored, merged automatically — see README) instead.
+
+config WASP_WIFI_PSK
+	string "WiFi passphrase (WPA2-PSK; empty = open network)"
+	default ""
+
 config WASP_RPC_TIMEOUT_MS
 	int "Remote-memory RPC timeout (ms)"
 	default 5000
