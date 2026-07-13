@@ -17,6 +17,8 @@
 #define WASP_REMOTE_H_
 
 #define WASP_REF(region, offset) (((unsigned)(region) << 24) | (unsigned)(offset))
+#define WASP_REF_REGION(ref) ((unsigned)(ref) >> 24)
+#define WASP_REF_OFFSET(ref) ((unsigned)(ref) & 0x00FFFFFFu)
 
 #define WASP_REMOTE_OK 0
 #define WASP_REMOTE_ELOCKED (-1)   /* region locked by someone else */

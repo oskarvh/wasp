@@ -140,6 +140,150 @@ go wrong comes back as a one-line error telling you what to fix:
 | `load failed: LOAD_FAILED(…)` | Not a valid module, or it imports functions the node doesn't provide, or its memory demands don't fit. The detail text is WAMR's actual diagnostic. |
 | `load failed: TOO_LARGE` | Module exceeds the 32 KiB cap. |
 
+## Remote memory: working on the coordinator's RAM
+
+Everything above is pure computation — data in, i32s out. Modules can
+also work on memory that lives in the **coordinator's** RAM: the node
+provides `wasp.*` host functions that fetch, write back, and lock
+*regions* the coordinator has explicitly shared, over the same TCP
+connection, while the module runs. (Design and rationale: the *Remote
+memory* section of the top-level README.)
+
+Three parties are involved; here is what each one needs.
+
+### On the node: nothing
+
+The firmware ships the host functions. A node that supports them
+advertises feature bit `0x01` in its handshake — visible in the `check`
+output:
+
+```
+  [ok] HELLO -> HELLO_ACK: v1, max payload 32768 B, features 0x01
+```
+
+### In the module: include the header, use the API
+
+Include `wasp/remote.h` (in `tools/include/`) — five functions, all
+returning `WASP_REMOTE_OK` (0) or a negative error:
+
+| Function | Does |
+| -------- | ---- |
+| `wasp_mem_read(ref, dst, len)` | Copy `len` bytes of coordinator memory at `ref` into the module. |
+| `wasp_mem_write(ref, src, len)` | Copy `len` bytes from the module into coordinator memory at `ref`. |
+| `wasp_lock(region)` / `wasp_unlock(region)` | Hold the region's mutex across several accesses. |
+| `wasp_region_size(region)` | Byte length of a shared region. |
+
+A **remote reference** (`ref`) names coordinator memory as a packed
+32-bit value: region id in the top 8 bits, byte offset in the low 24
+(`WASP_REF(region, offset)` builds one). Because the offset sits in the
+low bits, plain arithmetic walks a region — `ref + 4 * i` is element `i`
+of an i32 array, exactly like a pointer.
+
+A worked example — multiply an i32 array *in the coordinator's RAM* by
+`k`, in place (`scale.c`):
+
+```c
+#include "wasp/remote.h"
+
+/* Multiply n i32s in coordinator RAM by k, in place. The whole
+ * read-modify-write is one critical section. */
+__attribute__((export_name("scale")))
+int scale(unsigned ref, int n, int k)
+{
+	int buf[64];
+
+	if (n < 1 || n > 64)
+		return WASP_REMOTE_EBOUNDS;
+
+	int rc = wasp_lock(WASP_REF_REGION(ref));
+	if (rc != WASP_REMOTE_OK)
+		return rc;              /* ELOCKED: someone else holds it */
+
+	rc = wasp_mem_read(ref, buf, n * sizeof(int));
+	if (rc == WASP_REMOTE_OK) {
+		for (int i = 0; i < n; i++)
+			buf[i] *= k;
+		rc = wasp_mem_write(ref, buf, n * sizeof(int));
+	}
+	wasp_unlock(WASP_REF_REGION(ref));
+	return rc;
+}
+```
+
+Compile exactly as in Step 2, plus the include path:
+
+```sh
+clang --target=wasm32 -O2 -nostdlib -Itools/include \
+      -Wl,--no-entry -Wl,--export-dynamic -Wl,--strip-all \
+      -z stack-size=1024 \
+      -o scale.wasm scale.c
+```
+
+No linker flags for the imports — the `import_module("wasp")`
+attributes in the header are enough, and the node resolves them at
+instantiation. (Importing anything *outside* the `wasp` namespace still
+fails with `LOAD_FAILED`.)
+
+### On the coordinator: register regions, keep listening
+
+The coordinator is the memory host. It decides what is shared — a
+region is just a `bytearray` it registers under an id — and it must
+keep servicing the node's requests while a call is in flight.
+`WaspNode` does that automatically inside `request()`:
+
+```python
+import struct, sys; sys.path.insert(0, "tools")
+from wasp_client import WaspNode, pack_ref
+
+node = WaspNode("10.0.0.154", 4242)
+node.hello()
+node.load(open("scale.wasm", "rb").read())
+
+data = bytearray(struct.pack("<8i", *range(8)))  # the memory being shared
+node.register_region(1, data)
+
+print(node.call("scale", pack_ref(1), 8, 3))     # -> [0]  (WASP_REMOTE_OK)
+print(struct.unpack("<8i", data))                # -> (0, 3, 6, ..., 21)
+```
+
+The `bytearray` *is* the shared memory: the module's `wasp_mem_write`
+lands in it directly. Register the region before the call — an
+unregistered id comes back as `WASP_REMOTE_ENOREGION`. Memory that was
+never registered cannot be named at all.
+
+### Locking rules and error codes
+
+Every single `wasp_mem_read`/`wasp_mem_write` is atomic on its own —
+the coordinator serializes all access to a region, and you cannot
+observe a torn read or write. Take the lock only around **compound**
+operations (read-modify-write, multi-field updates), like `scale()`
+above. Locks are leases: if a node dies while holding one, the
+coordinator revokes it when the lease expires (5 s in the test client).
+While someone else holds a region's lock, *everything* — reads, writes,
+lock attempts — fails fast with `WASP_REMOTE_ELOCKED` rather than
+blocking; retry or back off in the module.
+
+| Code | Meaning / fix |
+| ---- | ------------- |
+| `WASP_REMOTE_OK` (0) | Success. |
+| `WASP_REMOTE_ELOCKED` (-1) | Another node holds the region's lock — retry later. |
+| `WASP_REMOTE_EBOUNDS` (-2) | Access reaches outside the region — check offset + length against `wasp_region_size()`. |
+| `WASP_REMOTE_ENOREGION` (-3) | No region with that id — the coordinator didn't `register_region()` it. |
+| `WASP_REMOTE_EIO` (-4) | The coordinator refused for another reason. |
+
+If the coordinator stops answering entirely (crash, unplugged cable),
+the pending host call gives up after 5 s
+(`CONFIG_WASP_RPC_TIMEOUT_MS`) and the module **traps** — the call
+returns `ERROR(TRAP, wasp: remote memory RPC failed …)` and the node
+carries on, same as any other trap.
+
+One performance rule: **every call is a network round-trip** (~ms,
+about a million times slower than local memory). Move data in bulk —
+one 64-byte read beats sixteen 4-byte reads sixteen-fold. The
+remote-memory self-test (`python3 tools/wasp_client.py <node-ip> remote
+tools/remote_module.wasm`) exercises all of the above if you want a
+reference transcript.
+
 ## Scripting it
 
 `tools/wasp_client.py` is importable — the same five lines the CLI uses:
