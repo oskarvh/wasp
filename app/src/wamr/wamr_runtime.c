@@ -60,6 +60,11 @@ int wasp_wamr_init(void)
 		return -ENOMEM;
 	}
 
+	if (wasp_remote_register_natives() != 0) {
+		wasm_runtime_destroy();
+		return -EINVAL;
+	}
+
 	LOG_INF("WAMR initialized (heap pool: %u bytes)", (unsigned)sizeof(wamr_heap_pool));
 	return 0;
 }
@@ -219,6 +224,7 @@ static void handle_call(const struct wasp_msg *msg)
 	}
 
 	/* -- execute -- */
+	wasp_exec_conn = msg->conn;
 	if (!wasm_runtime_call_wasm(loaded.exec_env, func, argc, cells)) {
 		const char *exception = wasm_runtime_get_exception(loaded.inst);
 

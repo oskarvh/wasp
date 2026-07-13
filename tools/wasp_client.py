@@ -6,15 +6,22 @@ Frame format must match app/src/protocol.h.
 Usage:
   wasp_client.py <node-ip> check                    # protocol self-test
   wasp_client.py <node-ip> lifecycle mod.wasm       # load/call/unload self-test
+  wasp_client.py <node-ip> remote mod.wasm          # remote-memory self-test
   wasp_client.py <node-ip> load mod.wasm
   wasp_client.py <node-ip> call <func> [i32 args...]
   wasp_client.py <node-ip> unload
+
+Remote memory: this client is also the authoritative memory host. Regions
+registered via WaspNode.register_region() are served to the node while any
+request is in flight; every access runs under the region's lock check, and
+explicit LOCKs are granted as expiring leases.
 """
 
 import argparse
 import random
 import socket
 import struct
+import time
 
 MAGIC = b"WA"
 PROTO_VERSION = 1
@@ -29,6 +36,24 @@ RESULT = 0x06
 ERROR = 0x07
 PING = 0x08
 PONG = 0x09
+MEM_READ = 0x40
+MEM_DATA = 0x41
+MEM_WRITE = 0x42
+MEM_ACK = 0x43
+LOCK = 0x44
+LOCK_GRANT = 0x45
+UNLOCK = 0x46
+REGION_INFO = 0x47
+REGION_DESC = 0x48
+
+NODE_REQUESTS = {MEM_READ, MEM_WRITE, LOCK, UNLOCK, REGION_INFO}
+
+FEAT_REMOTE_MEM = 0x01
+LOCK_LEASE_S = 5.0
+
+ERR_BAD_ARGS = 0x0A
+ERR_LOCKED = 0x0C
+ERR_NO_REGION = 0x0D
 
 ERR_NAMES = {
     0x01: "UNSUPPORTED",
@@ -42,7 +67,18 @@ ERR_NAMES = {
     0x09: "TRAP",
     0x0A: "BAD_ARGS",
     0x0B: "NO_FUNC",
+    0x0C: "LOCKED",
+    0x0D: "NO_REGION",
 }
+
+# wasp.* host function return codes as seen by the module
+# (WASP_REMOTE_* in tools/include/wasp/remote.h).
+R_OK, R_ELOCKED, R_EBOUNDS, R_ENOREGION = 0, -1, -2, -3
+
+
+def pack_ref(region: int, offset: int = 0) -> int:
+    """Remote reference: (region_id:8 | offset:24)."""
+    return (region << 24) | offset
 
 
 def err_name(payload: bytes) -> str:
@@ -60,17 +96,92 @@ class WaspNode:
         # Random start so a stale response from a previous connection
         # can't accidentally match our first request's seq.
         self.seq = random.randrange(256)
+        # Remote memory served to the node: region_id -> bytearray, and
+        # region_id -> (holder, lease expiry). Holder "node" is the
+        # connected node; tests use other names to simulate rival nodes.
+        self.regions: dict[int, bytearray] = {}
+        self.locks: dict[int, tuple[str, float]] = {}
+
+    def register_region(self, region_id: int, buf: bytearray):
+        """Export buf to the node as remote memory region region_id."""
+        self.regions[region_id] = buf
 
     def request(self, msg_type: int, payload: bytes = b"") -> tuple[int, int, bytes]:
-        """Send one frame and return the (type, seq, payload) response."""
+        """Send one frame and return the (type, seq, payload) response.
+
+        Node-initiated remote-memory requests arriving while we wait are
+        serviced inline — the node issues them mid-CALL.
+        """
         seq = self.seq = (self.seq + 1) & 0xFF
         self.sock.sendall(HDR.pack(MAGIC, msg_type, seq, len(payload)) + payload)
-        rtype, rseq, rpayload = self._recv_frame()
-        if rseq != seq:
-            raise ValueError(
-                f"response seq {rseq} does not match request seq {seq} "
-                f"(type 0x{rtype:02x}) — stale or corrupt stream")
-        return rtype, rseq, rpayload
+        while True:
+            rtype, rseq, rpayload = self._recv_frame()
+            if rtype in NODE_REQUESTS:
+                self._serve_node_req(rtype, rseq, rpayload)
+                continue
+            if rseq != seq:
+                raise ValueError(
+                    f"response seq {rseq} does not match request seq {seq} "
+                    f"(type 0x{rtype:02x}) — stale or corrupt stream")
+            return rtype, rseq, rpayload
+
+    # -- remote memory host (the coordinator side of wasp.*) ----------
+
+    def _lock_holder(self, region: int):
+        """Current unexpired lease holder of region, or None."""
+        held = self.locks.get(region)
+        if held is not None and held[1] > time.monotonic():
+            return held[0]
+        self.locks.pop(region, None)  # expired -> revoked
+        return None
+
+    def _serve_node_req(self, rtype: int, rseq: int, payload: bytes):
+        resp_type, resp = self._node_response(rtype, payload)
+        self.sock.sendall(HDR.pack(MAGIC, resp_type, rseq, len(resp)) + resp)
+
+    def _node_response(self, rtype: int, p: bytes) -> tuple[int, bytes]:
+        def error(code, detail=""):
+            return ERROR, bytes([code]) + detail.encode()
+
+        if rtype in (LOCK, UNLOCK, REGION_INFO):
+            if len(p) != 1:
+                return error(ERR_BAD_ARGS, "malformed request")
+            region = p[0]
+            if region not in self.regions:
+                return error(ERR_NO_REGION)
+            if rtype == REGION_INFO:
+                return REGION_DESC, struct.pack("<I", len(self.regions[region]))
+            holder = self._lock_holder(region)
+            if rtype == LOCK:
+                if holder not in (None, "node"):
+                    return error(ERR_LOCKED)
+                self.locks[region] = ("node", time.monotonic() + LOCK_LEASE_S)
+                return LOCK_GRANT, struct.pack("<I", int(LOCK_LEASE_S * 1000))
+            if holder != "node":  # UNLOCK
+                return error(ERR_BAD_ARGS, "not lock holder")
+            del self.locks[region]
+            return MEM_ACK, b""
+
+        # MEM_READ [ref u32][len u32] / MEM_WRITE [ref u32][data]
+        if len(p) < (8 if rtype == MEM_READ else 5):
+            return error(ERR_BAD_ARGS, "malformed request")
+        ref = struct.unpack_from("<I", p)[0]
+        region, offset = ref >> 24, ref & 0xFFFFFF
+        if region not in self.regions:
+            return error(ERR_NO_REGION)
+        if self._lock_holder(region) not in (None, "node"):
+            return error(ERR_LOCKED)
+        buf = self.regions[region]
+        if rtype == MEM_READ:
+            length = struct.unpack_from("<I", p, 4)[0]
+            if offset + length > len(buf):
+                return error(ERR_BAD_ARGS, "out of bounds")
+            return MEM_DATA, bytes(buf[offset:offset + length])
+        data = p[4:]
+        if offset + len(data) > len(buf):
+            return error(ERR_BAD_ARGS, "out of bounds")
+        buf[offset:offset + len(data)] = data
+        return MEM_ACK, b""
 
     def _recv_frame(self) -> tuple[int, int, bytes]:
         hdr = self._recv_exact(HDR.size)
@@ -90,12 +201,13 @@ class WaspNode:
 
     # -- convenience wrappers ------------------------------------------
 
-    def hello(self) -> tuple[int, int]:
-        """Handshake; returns (node proto version, max payload size)."""
+    def hello(self) -> tuple[int, int, int]:
+        """Handshake; returns (node proto version, max payload, features)."""
         t, _, payload = self.request(HELLO, bytes([PROTO_VERSION]))
-        if t != HELLO_ACK or len(payload) != 5:
+        if t != HELLO_ACK or len(payload) < 5:
             raise ValueError(f"bad HELLO_ACK: type {t}, {payload!r}")
-        return payload[0], struct.unpack("<I", payload[1:5])[0]
+        features = payload[5] if len(payload) >= 6 else 0
+        return payload[0], struct.unpack("<I", payload[1:5])[0], features
 
     def load(self, wasm: bytes):
         t, _, payload = self.request(LOAD_MODULE, wasm)
@@ -131,9 +243,9 @@ def expect_error(node: WaspNode, req_type: int, payload: bytes, want: str) -> bo
 
 
 def cmd_check(node: WaspNode, args):
-    version, max_payload = node.hello()
+    version, max_payload, features = node.hello()
     check("HELLO -> HELLO_ACK", version == PROTO_VERSION,
-          f"v{version}, max payload {max_payload} B")
+          f"v{version}, max payload {max_payload} B, features 0x{features:02x}")
 
     probe = b"wasp probe \x00\x01\x02"
     t, _, payload = node.request(PING, probe)
@@ -177,6 +289,57 @@ def cmd_lifecycle(node: WaspNode, args):
     print("all lifecycle checks passed")
 
 
+def cmd_remote(node: WaspNode, args):
+    """Remote-memory self-test against tools/remote_module.wasm."""
+    wasm = open(args.module, "rb").read()
+    version, _, features = node.hello()
+    check("node advertises remote memory", bool(features & FEAT_REMOTE_MEM),
+          f"features 0x{features:02x}")
+    node.load(wasm)
+
+    # Region 1: sixteen i32s, values 0..15 (sum 120).
+    region = bytearray(struct.pack("<16i", *range(16)))
+    node.register_region(1, region)
+    ref = pack_ref(1)
+
+    check("region_size from module", node.call("region_len", 1) == [64])
+    check("unknown region -> ENOREGION", node.call("region_len", 9) == [R_ENOREGION])
+
+    check("element-wise remote sum", node.call("sum_region", ref, 16) == [120])
+    check("bulk remote sum", node.call("sum_region_bulk", ref, 16) == [120])
+    check("reference arithmetic (offset ref)",
+          node.call("sum_region_bulk", pack_ref(1, 32), 8) == [sum(range(8, 16))])
+
+    check("remote write", node.call("fill_region", ref, 16, 7) == [R_OK])
+    check("coordinator memory updated",
+          region == bytearray(struct.pack("<16i", *([7] * 16))))
+
+    check("out-of-bounds read -> EBOUNDS",
+          node.call("sum_region_bulk", pack_ref(1, 40), 16) == [R_EBOUNDS])
+    check("out-of-bounds write -> EBOUNDS",
+          node.call("try_write", pack_ref(1, 61), 1) == [R_EBOUNDS])
+
+    struct.pack_into("<i", region, 0, 100)
+    check("locked read-modify-write", node.call("locked_add", 1, ref, 5) == [105])
+    check("lock released after locked_add", 1 not in node.locks)
+
+    # A rival node holds the lock: everything must fail fast, then the
+    # lease must expire and revoke it.
+    node.locks[1] = ("rival", time.monotonic() + 1.5)
+    check("write to locked region -> ELOCKED",
+          node.call("try_write", ref, 1) == [R_ELOCKED])
+    check("read of locked region -> ELOCKED",
+          node.call("sum_region_bulk", ref, 16) == [R_ELOCKED])
+    check("lock while held -> ELOCKED", node.call("locked_add", 1, ref, 1) == [R_ELOCKED])
+    time.sleep(1.6)
+    check("expired lease is revoked", node.call("try_write", ref, 42) == [R_OK])
+    check("write after revocation landed",
+          struct.unpack_from("<i", region, 0)[0] == 42)
+
+    node.unload()
+    print("all remote memory checks passed")
+
+
 def cmd_load(node: WaspNode, args):
     node.hello()
     node.load(open(args.module, "rb").read())
@@ -205,6 +368,8 @@ def main():
     sub.add_parser("check", help="protocol self-test")
     p = sub.add_parser("lifecycle", help="load/call/unload self-test")
     p.add_argument("module", help="path to .wasm file")
+    p = sub.add_parser("remote", help="remote-memory self-test")
+    p.add_argument("module", help="path to remote_module.wasm")
     p = sub.add_parser("load", help="load a module")
     p.add_argument("module", help="path to .wasm file")
     sub.add_parser("unload", help="unload the module")
@@ -216,8 +381,8 @@ def main():
     node = WaspNode(args.host, args.port)
     print(f"connected to {args.host}:{args.port}")
 
-    handlers = {"check": cmd_check, "lifecycle": cmd_lifecycle, "load": cmd_load,
-                "unload": cmd_unload, "call": cmd_call, None: cmd_check}
+    handlers = {"check": cmd_check, "lifecycle": cmd_lifecycle, "remote": cmd_remote,
+                "load": cmd_load, "unload": cmd_unload, "call": cmd_call, None: cmd_check}
     handlers[args.cmd](node, args)
 
 

@@ -99,6 +99,10 @@ Command set:
 - `ERROR` — `[code u8][optional utf8 detail]`, e.g. `TRAP(wasm operand
   stack overflow)`; codes in `app/src/protocol.h`
 - `PING` / `PONG` — liveness; `PONG` echoes the `PING` payload
+- `MEM_READ` / `MEM_WRITE` / `LOCK` / `UNLOCK` / `REGION_INFO` (0x4x) —
+  **node-initiated** remote-memory requests, sent mid-`CALL` in the
+  node's own seq space and answered by the coordinator; see
+  [Remote memory](#remote-memory--design-plan)
 
 A module that traps (e.g. `unreachable`, out-of-bounds access) returns
 `ERROR(TRAP, exception-text)` and the node carries on — the WASM sandbox
@@ -130,17 +134,20 @@ wasp/
 │   │   └── nucleo_f439zi.conf
 │   └── src/
 │       ├── main.c          # boot, queue setup, thread start
+│       ├── rpc.c           # node->coordinator RPC slot (remote memory)
 │       ├── net/            # network handler thread + framing
 │       ├── agent/          # agent thread + protocol dispatch
-│       └── wamr/           # thin wrapper around the WAMR runtime + executor
+│       └── wamr/           # WAMR wrapper + executor + wasp.* host functions
 ├── deps/                   # west-managed dependencies (NOT committed)
 │   ├── zephyr/
 │   └── modules/            # hal_stm32, cmsis, wasm-micro-runtime, …
 ├── docs/
 │   └── writing-modules.md  # C function -> node -> result, step by step
 ├── tools/
-│   ├── wasp_client.py      # protocol test client (embryonic coordinator)
+│   ├── wasp_client.py      # test client + remote-memory host (embryonic coordinator)
+│   ├── include/wasp/remote.h  # module-side remote memory API
 │   ├── test_module.c       # test WASM module (add/fib/boom)
+│   ├── remote_module.c     # remote-memory test module
 │   └── build_test_module.sh
 └── README.md
 ```
@@ -215,6 +222,188 @@ glue and builds WAMR's `vmlib` as a Zephyr library, enabled by
 `CONFIG_WAMR=y`. Memory placement is described under [Memory
 strategy](#memory-strategy) above.
 
+## Remote memory — design plan
+
+This is **software distributed shared memory**: when a module needs data
+that lives in the *coordinator's* RAM, the node fetches (or writes back)
+that memory over the wire on the module's behalf — so C code can work
+with pass-by-reference data whose backing store is on another machine.
+Phase 1 (explicit `wasp_mem_read`/`wasp_mem_write`/`wasp_lock` host
+functions — see `tools/include/wasp/remote.h`) is implemented and tested
+on hardware; the later phases below are the plan.
+
+### Can we overload the dereference?
+
+A hard constraint first, because it shapes everything below. Inside WASM
+a C pointer is just an i32 offset into the module's own linear memory —
+there is no MMU, no page fault, and an out-of-bounds access traps
+**non-resumably** in WAMR. So a *raw* C pointer to coordinator RAM can
+never be transparently dereferenced without modifying the interpreter
+itself. What we can do, in increasing order of transparency:
+
+1. **Explicit API (phase 1)** — host functions the module imports:
+   `wasp_mem_read(region, offset, dst, len)` / `wasp_mem_write(...)` plus
+   `wasp_lock` / `wasp_unlock`. Ugly but honest; everything else builds
+   on it.
+2. **Compile-time typed transparency for C (phase 2)** — clang's named
+   address spaces put "this pointer is remote" into the *type system*:
+   `#define wasp_remote __attribute__((address_space(1)))`, then
+   `wasp_remote int *arr` reads like a normal pointer (`arr[i]`,
+   `p->field`, pointer arithmetic) but is a distinct type — assigning it
+   to a local pointer without an explicit cast is a **compile error**,
+   so local/remote confusion is caught at build time and propagated
+   automatically through every assignment, argument, and dereference. A
+   small LLVM pass plugin (`-fpass-plugin=`) rewrites loads/stores
+   through address space 1 into `__wasp_remote_load/store` calls, which
+   are ordinary WASM imports: the emitted module is plain, valid wasm32,
+   and code using only local pointers compiles exactly as before, zero
+   overhead. C++ gets the same ergonomics with no compiler plugin at
+   all, via `remote_ptr<T>` overloading `operator*` / `operator->` /
+   `operator[]` with a write-through proxy.
+3. **Fully transparent raw pointers (phase 4, research)** — for code
+   that cannot be annotated (third-party sources, `void *` plumbing,
+   `memcpy`): either an ASan-style pass that instruments *every*
+   load/store with a reserved-window check (fully transparent, but a
+   compare on each access), or patching the interpreter's bounds check
+   so a reserved address window above linear memory faults into a fetch
+   hook instead of trapping (WAMR's *shared heap* feature already routes
+   such addresses to a second host-managed heap, so the plumbing
+   half-exists — but it means carrying a WAMR patch). Explicitly out of
+   scope until phases 1–3 are proven.
+
+Why not *infer* remoteness with no annotation at all? Pointer
+provenance in C is statically undecidable — pointers flow through
+integers, unions, `memcpy`, and data structures no compiler can trace —
+and link time is too late (wasm-ld sees opaque function bodies, not
+types). One qualifier at the declaration site, type-checked from there
+on, is the practical ceiling for compile-time detection.
+
+### Remote references are capabilities, not addresses
+
+A module must never hold a raw coordinator RAM address — only memory the
+coordinator has **explicitly exported** is reachable, and non-shared
+coordinator memory simply has no name a node could use. The coordinator
+registers a buffer as a *region* — `(region_id, base, length)` on its
+side — and hands modules remote references as ordinary i32 `CALL`
+arguments, packed `region_id:8 | offset:24` (up to 256 live regions of
+16 MiB each). The packing keeps the v1 i32-only calling convention
+intact and, crucially, lets plain C pointer arithmetic (`ref + i`) work
+on the packed value. Every access carries an explicit length and is
+bounds-checked **twice**: on the node against a cached region descriptor
+(fast local failure), and again by the coordinator, which is
+authoritative — even a compromised node cannot reach outside a region.
+
+### The role reversal: node-initiated requests
+
+Everything so far is strictly coordinator-asks, node-answers. Remote
+memory reverses this mid-call: while the executor is inside
+`wasm_runtime_call_wasm`, a host function must send a request *to* the
+coordinator and block until the reply arrives. That needs:
+
+- **Protocol v2**: a node-initiated message range (`MEM_READ`,
+  `MEM_WRITE`, `LOCK`, `UNLOCK` + their acks) with its own seq space, so
+  both directions can be in flight on the one TCP connection without
+  ambiguity. Feature-negotiated in `HELLO` so old clients keep working.
+- **An RPC slot in the firmware**: executor posts the request to the tx
+  queue and blocks on a semaphore; the agent routes the coordinator's
+  reply back to the slot. Executor is serialized, so exactly one
+  outstanding remote op — no table needed. A timeout or connection drop
+  fails the RPC and the host function raises a WASM exception, surfacing
+  to the coordinator as `ERROR(TRAP, "remote memory timeout")` — a hung
+  coordinator must not wedge the node.
+
+### Races: who protects the coordinator's RAM?
+
+The coordinator's copy is the **single authoritative copy**, and **all
+lock state lives in the coordinator** — a node never decides whether a
+region is locked; it only sends requests. Concretely:
+
+- **Every read and write RPC is mutex-protected, unconditionally.** The
+  coordinator wraps each `MEM_READ`/`MEM_WRITE` in the target region's
+  mutex, so a single access is always atomic and a torn read or write
+  can never be observed. A module cannot opt out: the serialization
+  happens on the coordinator, after the request has left the node.
+- **Explicit `LOCK` = holding that same region mutex across multiple
+  RPCs**, for compound operations (read-modify-write, multi-field
+  updates). Locks are granted as **leases** with an expiry, so a node
+  that dies mid-critical-section cannot deadlock the swarm — the lease
+  expires and the coordinator revokes it.
+- **Enforced, not advisory.** While node A holds a region's lock, a
+  read or write from anyone else **fails fast** with `ERROR(LOCKED)` —
+  it neither interleaves silently nor blocks. (Blocking would stall the
+  other node's executor invisibly mid-WASM-call; a fast error lets that
+  module retry or take the lock properly.)
+
+Consistency model: phase 1 is *no caching* — every access is a
+round-trip, so it is sequentially consistent and slow (~ms per access vs
+ns locally; the API shape pushes users toward bulk transfers). Phase 3
+adds a node-side page cache with **release consistency**: acquire a lock
+→ invalidate cached pages of that region; release → write back dirty
+pages. That is the classic DSM trade (IVY/TreadMarks lineage) and it is
+where the real performance lives.
+
+### Implementation todo list
+
+Phase 1 — explicit remote memory, end to end (**implemented**):
+
+- [x] Protocol v2 in `protocol.h`: node-initiated types (`MEM_READ`,
+      `MEM_DATA`, `MEM_WRITE`, `MEM_ACK`, `LOCK`, `LOCK_GRANT`,
+      `UNLOCK`, `REGION_INFO` for descriptor fetch), `ERROR(LOCKED)`
+      code, separate node-side seq space, `HELLO` feature flag.
+- [x] Firmware RPC core (`app/src/rpc.c`): blocking
+      executor→coordinator request/response slot (semaphore + timeout),
+      reply routing in the agent; a silent coordinator traps the module
+      (`ERROR(TRAP)`) after `CONFIG_WASP_RPC_TIMEOUT_MS` and the node
+      carries on.
+- [x] Host function module (`app/src/wamr/native_remote.c`): `wasp.*`
+      natives registered with WAMR; module buffer pointers validated
+      and translated by WAMR's `*~` signature markers; imports from the
+      `wasp` namespace now resolve at instantiation.
+- [x] Coordinator side (`tools/wasp_client.py`): region registry
+      (`register_region(id, bytearray)`), serves `MEM_READ`/`MEM_WRITE`
+      inline while requests are in flight, lease-based locks with
+      expiry-revocation, fail-fast `LOCKED` rejection of non-holders,
+      authoritative bounds checks.
+- [x] Tests (`wasp_client.py <ip> remote tools/remote_module.wasm` +
+      deaf-coordinator timeout test): remote sum (element-wise, bulk,
+      via reference arithmetic), remote write-back, locked
+      read-modify-write, fail-fast `LOCKED` for reads/writes/locks
+      while a rival holds the lease, lease expiry revocation,
+      out-of-bounds rejection, RPC timeout → `TRAP` with node survival.
+      (A true two-node lost-update demo needs a second board.)
+
+Phase 2 — ergonomics:
+
+- [ ] `wasp/remote.h` for C: `wasp_remote` address-space qualifier,
+      packed-reference helpers, bulk read/write wrappers, lock guard
+      macros — usable stand-alone (explicit calls) before the pass
+      plugin exists.
+- [ ] LLVM pass plugin (`-fpass-plugin=`): lower loads/stores through
+      address space 1 to `__wasp_remote_load/store_*` imports; verify
+      pointer arithmetic, structs, and arrays on packed references;
+      unsupported constructs must be a compile error, never a silent
+      miscompile.
+- [ ] `wasp/remote.hpp` for C++: `remote_ptr<T>` with overloaded
+      `operator*` / `operator->` / `operator[]` and write-through proxy;
+      `remote_lock` RAII guard — same transparency, no compiler plugin
+      needed. Verify clang wasm32 C++ (`-fno-exceptions -fno-rtti
+      -nostdlib`) fits the size budget.
+- [ ] `docs/writing-modules.md`: new chapter with a worked
+      pass-by-reference example and performance guidance (batch, don't
+      peek).
+
+Phase 3 — performance:
+
+- [ ] Node-side page cache (DTCM candidate) with dirty tracking,
+      write-back on unlock/flush, invalidate on lock acquire; cache
+      statistics queryable over the protocol.
+
+Phase 4 — research:
+
+- [ ] Un-annotated code: ASan-style instrument-every-access pass, or a
+      transparent raw-pointer window via interpreter bounds-check hook /
+      shared-heap adaptation; upstream-ability of such a WAMR patch.
+
 ## Status / roadmap
 
 - [x] Architecture (this document)
@@ -222,5 +411,9 @@ strategy](#memory-strategy) above.
 - [x] Thread + queue skeleton (network handler, agent, executor)
 - [x] Wire protocol implementation (framing, HELLO/PING/ERROR)
 - [x] WASM module lifecycle (load / call / unload) end to end — i32-only v1 calling convention
+- [x] Remote memory phase 1: modules read/write/lock coordinator RAM via
+      `wasp.*` host functions (see
+      [Remote memory — design plan](#remote-memory--design-plan));
+      phases 2–4 (typed transparency, caching, un-annotated code) planned
 - [ ] Coordinator (separate effort)
 - [ ] More boards

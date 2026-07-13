@@ -1,11 +1,15 @@
 #!/bin/sh
-# Build tools/test_module.c into test_module.wasm using clang + wasm-ld.
+# Build the test modules (test_module.c, remote_module.c) with clang + wasm-ld.
 set -eu
 cd "$(dirname "$0")"
 
-clang --target=wasm32 -O2 -nostdlib \
-	-Wl,--no-entry -Wl,--export-dynamic -Wl,--strip-all \
-	-z stack-size=1024 \
-	-o test_module.wasm test_module.c
+build() {
+	clang --target=wasm32 -O2 -nostdlib -Iinclude \
+		-Wl,--no-entry -Wl,--export-dynamic -Wl,--strip-all \
+		-z stack-size=1024 \
+		-o "$1.wasm" "$1.c"
+	ls -l "$1.wasm"
+}
 
-ls -l test_module.wasm
+build test_module
+build remote_module

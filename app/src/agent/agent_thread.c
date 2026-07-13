@@ -16,7 +16,7 @@ LOG_MODULE_REGISTER(wasp_agent, LOG_LEVEL_INF);
 
 static void handle_hello(const struct wasp_msg *msg)
 {
-	uint8_t ack[5];
+	uint8_t ack[6];
 
 	if (msg->len >= 1 && msg->payload[0] != WASP_PROTO_VERSION) {
 		LOG_WRN("coordinator speaks protocol v%u, node speaks v%u", msg->payload[0],
@@ -25,6 +25,7 @@ static void handle_hello(const struct wasp_msg *msg)
 
 	ack[0] = WASP_PROTO_VERSION;
 	sys_put_le32(CONFIG_WASP_MAX_MODULE_SIZE, &ack[1]);
+	ack[5] = WASP_FEAT_REMOTE_MEM;
 	wasp_queue_tx(msg, WASP_MSG_HELLO_ACK, ack, sizeof(ack));
 	LOG_INF("coordinator handshake complete");
 }
@@ -49,6 +50,18 @@ static void handle_msg(struct wasp_msg *msg)
 			break;
 		}
 		return; /* payload now owned by the executor */
+	case WASP_MSG_MEM_DATA:
+	case WASP_MSG_MEM_ACK:
+	case WASP_MSG_LOCK_GRANT:
+	case WASP_MSG_REGION_DESC:
+	case WASP_MSG_ERROR:
+		/* Coordinator's answer to a node-initiated RPC. */
+		if (wasp_rpc_deliver(msg)) {
+			return; /* payload now owned by the RPC caller */
+		}
+		LOG_WRN("unsolicited response type 0x%02x seq %u, dropping", msg->type,
+			msg->seq);
+		break;
 	default:
 		LOG_WRN("unknown message type 0x%02x", msg->type);
 		wasp_queue_error(msg, WASP_ERR_BAD_TYPE, NULL);

@@ -29,6 +29,14 @@ config WASP_WASM_HEAP_SIZE
 	  Backs malloc() inside the WASM module (libc-builtin). Carved from
 	  the module's memory space at instantiation time.
 
+config WASP_RPC_TIMEOUT_MS
+	int "Remote-memory RPC timeout (ms)"
+	default 5000
+	help
+	  How long a wasp.* host function waits for the coordinator to
+	  answer a MEM_READ/MEM_WRITE/LOCK/... request before giving up and
+	  raising a WASM exception on the calling module.
+
 config WASP_NET_THREAD_STACK_SIZE
 	int "Network handler thread stack size"
 	default 4096

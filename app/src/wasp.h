@@ -51,4 +51,28 @@ int wasp_queue_tx(const struct wasp_msg *req, uint8_t type, const void *payload,
 /* Queue an ERROR response to req: [code u8][optional utf8 detail]. */
 int wasp_queue_error(const struct wasp_msg *req, uint8_t err, const char *detail);
 
+/*
+ * Node-initiated RPC to the coordinator (remote memory). Only the
+ * executor thread may call wasp_rpc_call — it is the one place a
+ * request can originate (inside a host function, mid-CALL), so a single
+ * response slot suffices. Sends a frame with the node's own seq space,
+ * stamped with connection generation conn, and blocks until the
+ * coordinator's response arrives or timeout expires.
+ *
+ * On 0, *resp holds the response (type/len/payload; payload from
+ * wasp_payload_heap, freed by the caller). -ETIMEDOUT or -ENOMEM/-EAGAIN
+ * on send failure.
+ */
+int wasp_rpc_call(uint8_t type, const void *payload, uint32_t len, uint8_t conn,
+		  struct wasp_msg *resp, k_timeout_t timeout);
+
+/*
+ * Called by the agent for inbound coordinator->node response frames
+ * (MEM_DATA, MEM_ACK, LOCK_GRANT, REGION_DESC, ERROR). Returns true if
+ * the message matched the outstanding RPC and was consumed (payload
+ * ownership transferred); false if no RPC wants it (caller keeps
+ * ownership).
+ */
+bool wasp_rpc_deliver(struct wasp_msg *msg);
+
 #endif /* WASP_H_ */

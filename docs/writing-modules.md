@@ -43,7 +43,7 @@ back as clean errors, never crashes):
 | ---- | --- |
 | Mark every callable function `__attribute__((export_name("...")))` | Only exported functions are visible to `CALL`. The exported name is what you call, regardless of the C name. |
 | Parameters and return values must be `int` (i32) | The v1 wire format only carries 32-bit integer cells. `float`, `double`, `long long` and pointers-as-return-API are rejected with `BAD_ARGS`. |
-| No external functions (nothing to link against) | The node currently provides no host functions, so a module that *imports* anything fails to instantiate (`LOAD_FAILED`). That means no `printf`, no libc — pure computation. |
+| No external functions, except `wasp.*` | The only host functions the node provides are the remote-memory API (`tools/include/wasp/remote.h` — read/write/lock coordinator RAM; see the README's *Remote memory* section). Importing anything else fails to instantiate (`LOAD_FAILED`). That means no `printf`, no libc — pure computation plus remote memory. |
 | Keep it small | Modules are capped at 32 KiB on the wire (`CONFIG_WASP_MAX_MODULE_SIZE`, advertised in the handshake). |
 
 Within the module you *can* use statics, arrays, recursion, and even
@@ -162,8 +162,12 @@ scripts fail loudly.
 
 - i32 arguments and results only; max 8 args, 4 results.
 - One module loaded at a time per node.
-- No host functions yet — modules cannot do I/O or touch peripherals;
-  results must come back through return values.
+- No I/O or peripheral host functions yet — the only window to the
+  outside world is the remote-memory API (`#include "wasp/remote.h"`,
+  compile with `-Itools/include`): read, write, and lock regions of
+  coordinator RAM that the coordinator has exported. See
+  `tools/remote_module.c` for a worked example and the top-level
+  README's *Remote memory* section for the model.
 - Function names ≤ 63 bytes; modules ≤ 32 KiB.
 
 The wire format behind all of this is documented in the top-level README

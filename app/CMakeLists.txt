@@ -10,9 +10,11 @@ project(wasp LANGUAGES C)
 
 target_sources(app PRIVATE
   src/main.c
+  src/rpc.c
   src/net/net_thread.c
   src/agent/agent_thread.c
   src/wamr/wamr_runtime.c
+  src/wamr/native_remote.c
 )
 
 target_include_directories(app PRIVATE src)
