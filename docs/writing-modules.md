@@ -290,6 +290,38 @@ the pending host call gives up after 5 s
 returns `ERROR(TRAP, wasp: remote memory RPC failed …)` and the node
 carries on, same as any other trap.
 
+### Atomic primitives: skip the lock entirely
+
+For the most common compound operation — read-modify-write of a single
+i32 — you don't need a lock at all. The coordinator serializes every
+request it services, so these two host functions do the whole
+read-modify-write inside that window, race-free against every other
+node, in **one round-trip** (nodes advertise them as feature bit
+`0x02`):
+
+```c
+int old;
+wasp_add(ref, 1, &old);                  /* atomic *ref += 1; old value out */
+
+unsigned seen;
+wasp_cas(ref, expected, desired, &seen); /* write desired iff *ref == expected */
+if (seen == expected) { /* won the swap */ }
+```
+
+`wasp_cas` covers arbitrary small updates: read the value, compute the
+new one, CAS it back, and repeat only if another node really did change
+it in between — each attempt costs one round-trip, not a
+lock/read/write/unlock cycle. In C++, `remote_ptr<T>` exposes the same
+as `p.fetch_add(n)` and `p.compare_exchange(expected, desired)`.
+
+Both primitives respect explicit locks (they fail with
+`WASP_REMOTE_ELOCKED` while another node holds the region), so they
+compose with lock-based code. Measured on a 6-node swarm hammering one
+counter (150 increments): fail-fast locks took 60 s with ~1000
+`ELOCKED` retries; coordinator-queued locks took 10 s with zero
+retries; `wasp_add` took **1.5 s** — reach for a lock only when an
+invariant genuinely spans multiple words or operations.
+
 One performance rule: **every call is a network round-trip** (~ms,
 about a million times slower than local memory). Move data in bulk —
 one 64-byte read beats sixteen 4-byte reads sixteen-fold. The

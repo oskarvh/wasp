@@ -31,7 +31,7 @@ static void handle_hello(const struct wasp_msg *msg)
 
 	ack[0] = WASP_PROTO_VERSION;
 	sys_put_le32(CONFIG_WASP_MAX_MODULE_SIZE, &ack[1]);
-	ack[5] = WASP_FEAT_REMOTE_MEM;
+	ack[5] = WASP_FEAT_REMOTE_MEM | WASP_FEAT_ATOMICS;
 	wasp_queue_tx(msg, WASP_MSG_HELLO_ACK, ack, sizeof(ack));
 	LOG_INF("coordinator handshake complete");
 }

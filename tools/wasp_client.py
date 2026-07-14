@@ -52,11 +52,19 @@ LOCK_GRANT = 0x45
 UNLOCK = 0x46
 REGION_INFO = 0x47
 REGION_DESC = 0x48
+MEM_ADD = 0x49
+MEM_CAS = 0x4A
 
-NODE_REQUESTS = {MEM_READ, MEM_WRITE, LOCK, UNLOCK, REGION_INFO}
+NODE_REQUESTS = {MEM_READ, MEM_WRITE, LOCK, UNLOCK, REGION_INFO, MEM_ADD, MEM_CAS}
 
 FEAT_REMOTE_MEM = 0x01
+FEAT_ATOMICS = 0x02
 LOCK_LEASE_S = 5.0
+# Queued-lock mode: how long a LOCK may stay parked before the
+# coordinator gives up and answers ERROR(LOCKED). Must stay under the
+# node's RPC timeout (CONFIG_WASP_RPC_TIMEOUT_MS, 5 s) or the waiting
+# module traps instead of seeing a clean ELOCKED.
+LOCK_QUEUE_WAIT_S = 4.0
 ANNOUNCE_PORT = 4243
 
 ERR_BAD_ARGS = 0x0A
@@ -135,23 +143,35 @@ class WaspNode:
     # Serializes all remote-memory servicing. With one connection this
     # changes nothing; a multi-node coordinator (threads sharing regions
     # and locks dicts across WaspNode instances) relies on it — it IS
-    # the "coordinator serializes every access" guarantee.
+    # the "coordinator serializes every access" guarantee. A Condition
+    # so queued-lock waiters can sleep with the mutex released and be
+    # woken by UNLOCK (Condition.wait drops the underlying lock).
     _mem_mutex = threading.Lock()
+    _mem_cond = threading.Condition(_mem_mutex)
 
     def __init__(self, host: str, port: int, timeout: float = 5.0,
-                 lock_owner: str = "node"):
+                 lock_owner: str = "node", queue_locks: bool = False):
         self.sock = socket.create_connection((host, port), timeout=timeout)
+        # Latency-sensitive small-frame RPC: never wait on Nagle.
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         # Random start so a stale response from a previous connection
         # can't accidentally match our first request's seq.
         self.seq = random.randrange(256)
         # Lock-holder identity of the node behind this connection; give
         # each node a distinct name when sharing locks between nodes.
         self.lock_owner = lock_owner
+        # Queued-lock mode: a contended LOCK parks (FIFO, fair) until
+        # the holder unlocks, instead of failing fast with
+        # ERROR(LOCKED). Coordinator policy — the node can't tell the
+        # difference beyond the grant arriving later.
+        self.queue_locks = queue_locks
         # Remote memory served to the node: region_id -> bytearray, and
         # region_id -> (holder, lease expiry). A multi-node coordinator
-        # assigns the same dicts to every WaspNode to share the memory.
+        # assigns the same dicts to every WaspNode to share the memory
+        # (and the lock_queue when using queued locks).
         self.regions: dict[int, bytearray] = {}
         self.locks: dict[int, tuple[str, float]] = {}
+        self.lock_queue: dict[int, list[str]] = {}
 
     def register_region(self, region_id: int, buf: bytearray):
         """Export buf to the node as remote memory region region_id."""
@@ -187,9 +207,39 @@ class WaspNode:
         return None
 
     def _serve_node_req(self, rtype: int, rseq: int, payload: bytes):
-        with WaspNode._mem_mutex:
+        with WaspNode._mem_cond:
             resp_type, resp = self._node_response(rtype, payload)
         self.sock.sendall(HDR.pack(MAGIC, resp_type, rseq, len(resp)) + resp)
+
+    def _grant(self, region: int) -> tuple[int, bytes]:
+        self.locks[region] = (self.lock_owner, time.monotonic() + LOCK_LEASE_S)
+        return LOCK_GRANT, struct.pack("<I", int(LOCK_LEASE_S * 1000))
+
+    def _lock_response(self, region: int) -> tuple[int, bytes]:
+        """Grant, or (queued mode) park FIFO-fair until the holder frees
+        the region. Runs with _mem_cond held; wait() releases it so the
+        holder's own UNLOCK can be serviced by its thread meanwhile."""
+        if self._lock_holder(region) in (None, self.lock_owner):
+            return self._grant(region)
+        if not self.queue_locks:
+            return ERROR, bytes([ERR_LOCKED])
+
+        queue = self.lock_queue.setdefault(region, [])
+        queue.append(self.lock_owner)
+        deadline = time.monotonic() + LOCK_QUEUE_WAIT_S
+        try:
+            while True:
+                if (queue[0] == self.lock_owner and
+                        self._lock_holder(region) in (None, self.lock_owner)):
+                    return self._grant(region)
+                if time.monotonic() >= deadline:
+                    # Queue too deep for the node's RPC timeout:
+                    # fail fast after all rather than trap the module.
+                    return ERROR, bytes([ERR_LOCKED])
+                # Short timeout so lazy lease expiry is noticed too.
+                WaspNode._mem_cond.wait(0.05)
+        finally:
+            queue.remove(self.lock_owner)
 
     def _node_response(self, rtype: int, p: bytes) -> tuple[int, bytes]:
         def error(code, detail=""):
@@ -203,17 +253,38 @@ class WaspNode:
                 return error(ERR_NO_REGION)
             if rtype == REGION_INFO:
                 return REGION_DESC, struct.pack("<I", len(self.regions[region]))
-            holder = self._lock_holder(region)
             if rtype == LOCK:
-                if holder not in (None, self.lock_owner):
-                    return error(ERR_LOCKED)
-                self.locks[region] = (self.lock_owner,
-                                      time.monotonic() + LOCK_LEASE_S)
-                return LOCK_GRANT, struct.pack("<I", int(LOCK_LEASE_S * 1000))
-            if holder != self.lock_owner:  # UNLOCK
+                return self._lock_response(region)
+            if self._lock_holder(region) != self.lock_owner:  # UNLOCK
                 return error(ERR_BAD_ARGS, "not lock holder")
             del self.locks[region]
+            WaspNode._mem_cond.notify_all()  # wake queued LOCK waiters
             return MEM_ACK, b""
+
+        # MEM_ADD [ref][delta i32] / MEM_CAS [ref][expected][desired]:
+        # the whole read-modify-write happens inside this serialized
+        # window, which is what makes it atomic across all nodes.
+        if rtype in (MEM_ADD, MEM_CAS):
+            if len(p) != (8 if rtype == MEM_ADD else 12):
+                return error(ERR_BAD_ARGS, "malformed request")
+            ref = struct.unpack_from("<I", p)[0]
+            region, offset = ref >> 24, ref & 0xFFFFFF
+            if region not in self.regions:
+                return error(ERR_NO_REGION)
+            if self._lock_holder(region) not in (None, self.lock_owner):
+                return error(ERR_LOCKED)
+            buf = self.regions[region]
+            if offset + 4 > len(buf):
+                return error(ERR_BAD_ARGS, "out of bounds")
+            old = struct.unpack_from("<I", buf, offset)[0]
+            if rtype == MEM_ADD:
+                delta = struct.unpack_from("<i", p, 4)[0]
+                struct.pack_into("<I", buf, offset, (old + delta) & 0xFFFFFFFF)
+            else:
+                expected, desired = struct.unpack_from("<II", p, 4)
+                if old == expected:
+                    struct.pack_into("<I", buf, offset, desired)
+            return MEM_DATA, struct.pack("<I", old)
 
         # MEM_READ [ref u32][len u32] / MEM_WRITE [ref u32][data]
         if len(p) < (8 if rtype == MEM_READ else 5):
@@ -388,6 +459,18 @@ def cmd_remote(node: WaspNode, args):
     check("expired lease is revoked", node.call("try_write", ref, 42) == [R_OK])
     check("write after revocation landed",
           struct.unpack_from("<i", region, 0)[0] == 42)
+
+    # Atomic primitives: whole read-modify-write in one RPC.
+    check("atomic fetch-and-add", node.call("atomic_add", ref, 8) == [50]
+          and struct.unpack_from("<i", region, 0)[0] == 50)
+    check("CAS wins when value matches", node.call("cas_swap", ref, 50, 60) == [50]
+          and struct.unpack_from("<i", region, 0)[0] == 60)
+    check("CAS loses when value changed", node.call("cas_swap", ref, 50, 99) == [60]
+          and struct.unpack_from("<i", region, 0)[0] == 60)
+    node.locks[1] = ("rival", time.monotonic() + LOCK_LEASE_S)
+    check("atomic on locked region -> ELOCKED",
+          node.call("atomic_add", ref, 1) == [R_ELOCKED])
+    del node.locks[1]
 
     node.unload()
     print("all remote memory checks passed")

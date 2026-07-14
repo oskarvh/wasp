@@ -32,8 +32,12 @@ LOG_MODULE_REGISTER(wasp_net, LOG_LEVEL_INF);
 K_SEM_DEFINE(wasp_net_ready, 0, 1);
 atomic_t wasp_node_busy;
 
-/* How often the serve loop wakes to drain wasp_tx_q while idle. */
-#define SERVE_POLL_MS 50
+/* How often the serve loop wakes to drain wasp_tx_q while idle. This
+ * bounds the latency of every node-initiated RPC (remote memory): the
+ * request sits in wasp_tx_q until the poll wakes. 50 ms here made the
+ * TX wait — not the network — the dominant cost of remote memory
+ * (measured: ~45 of 46 s in a 6-node locked-increment run). */
+#define SERVE_POLL_MS 2
 
 /* A peer that stalls mid-frame longer than this is dropped, so a broken
  * coordinator cannot wedge the node's single connection slot. */
@@ -415,9 +419,14 @@ static void net_thread_fn(void *a, void *b, void *c)
 		conn_gen++;
 
 		struct zsock_timeval timeout = {.tv_sec = SOCK_TIMEOUT_SECONDS};
+		int nodelay = 1;
 
 		zsock_setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 		zsock_setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+		/* Frames go out as header + payload (two sends); without
+		 * this, Nagle holds the second segment for the peer's
+		 * delayed ACK — ~40 ms on every small RPC. */
+		zsock_setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
 		atomic_set(&wasp_node_busy, 1);
 		wasp_led_set(WASP_LED_CONNECTED);

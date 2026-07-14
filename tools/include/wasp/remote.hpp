@@ -107,6 +107,29 @@ public:
 		return wasp_mem_write(ref_, src, count * sizeof(T));
 	}
 
+	/* Atomic fetch-and-add: race-free against every other node in one
+	 * round-trip, no lock needed. Returns the OLD value; traps on
+	 * failure like a dereference. i32-sized T only. */
+	T fetch_add(T delta) const
+	{
+		static_assert(sizeof(T) == 4, "atomics are i32-sized");
+		int old;
+
+		check(wasp_add(ref_, (int)delta, &old));
+		return (T)old;
+	}
+
+	/* Atomic compare-and-swap: writes desired iff the current value is
+	 * expected. Returns the old value — you won iff it == expected. */
+	T compare_exchange(T expected, T desired) const
+	{
+		static_assert(sizeof(T) == 4, "atomics are i32-sized");
+		unsigned old;
+
+		check(wasp_cas(ref_, (unsigned)expected, (unsigned)desired, &old));
+		return (T)old;
+	}
+
 	constexpr unsigned ref() const { return ref_; }
 	constexpr unsigned region() const { return WASP_REF_REGION(ref_); }
 	constexpr unsigned offset() const { return WASP_REF_OFFSET(ref_); }

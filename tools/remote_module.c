@@ -107,3 +107,28 @@ EXPORT("region_len") int region_len(unsigned region)
 {
 	return wasp_region_size(region);
 }
+
+/* Atomic fetch-and-add: the same increment as racy_add/locked_add in
+ * exactly ONE round-trip, race-free with no lock. Returns the new
+ * value, or a negative WASP_REMOTE_* error. */
+EXPORT("atomic_add") int atomic_add(unsigned ref, int delta)
+{
+	int old;
+	int rc = wasp_add(ref, delta, &old);
+
+	return rc == WASP_REMOTE_OK ? old + delta : rc;
+}
+
+/* One compare-and-swap attempt; returns the OLD value (caller won iff
+ * it equals expected), or a negative error. The self-test drives both
+ * the win and lose paths through this. */
+EXPORT("cas_swap") int cas_swap(unsigned ref, unsigned expected, unsigned desired)
+{
+	unsigned old;
+	int rc = wasp_cas(ref, expected, desired, &old);
+
+	if (rc != WASP_REMOTE_OK) {
+		return rc;
+	}
+	return (int)old;
+}

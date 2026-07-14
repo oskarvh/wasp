@@ -167,6 +167,51 @@ static int32_t native_unlock(wasm_exec_env_t exec_env, uint32_t region)
 	return finish(&resp, WASP_MSG_MEM_ACK, 0, WASP_REMOTE_OK);
 }
 
+/*
+ * Shared body of the atomic RPCs: send req, expect MEM_DATA[old u32],
+ * store the old value through the module's out-pointer. The '*'
+ * signature marker only guarantees the pointer itself is in linear
+ * memory, so the 4-byte width is validated here.
+ */
+static int32_t atomic_rpc(wasm_exec_env_t exec_env, uint8_t type, const uint8_t *req,
+			  uint32_t req_len, uint32_t *old_out)
+{
+	struct wasp_msg resp;
+
+	if (!wasm_runtime_validate_native_addr(wasm_runtime_get_module_inst(exec_env), old_out,
+					       sizeof(*old_out))) {
+		return WASP_REMOTE_EBOUNDS;
+	}
+	if (rpc(exec_env, type, req, req_len, &resp) != 0) {
+		return WASP_REMOTE_EIO;
+	}
+	if (resp.type == WASP_MSG_MEM_DATA && resp.len == 4) {
+		*old_out = sys_get_le32(resp.payload);
+	}
+	return finish(&resp, WASP_MSG_MEM_DATA, 4, WASP_REMOTE_OK);
+}
+
+static int32_t native_add(wasm_exec_env_t exec_env, uint32_t ref, int32_t delta,
+			  uint32_t *old_out)
+{
+	uint8_t req[8];
+
+	sys_put_le32(ref, &req[0]);
+	sys_put_le32((uint32_t)delta, &req[4]);
+	return atomic_rpc(exec_env, WASP_MSG_MEM_ADD, req, sizeof(req), old_out);
+}
+
+static int32_t native_cas(wasm_exec_env_t exec_env, uint32_t ref, uint32_t expected,
+			  uint32_t desired, uint32_t *old_out)
+{
+	uint8_t req[12];
+
+	sys_put_le32(ref, &req[0]);
+	sys_put_le32(expected, &req[4]);
+	sys_put_le32(desired, &req[8]);
+	return atomic_rpc(exec_env, WASP_MSG_MEM_CAS, req, sizeof(req), old_out);
+}
+
 static int32_t native_region_size(wasm_exec_env_t exec_env, uint32_t region)
 {
 	uint8_t req = region;
@@ -193,6 +238,8 @@ int wasp_remote_register_natives(void)
 		{"lock", native_lock, "(i)i", NULL},
 		{"unlock", native_unlock, "(i)i", NULL},
 		{"region_size", native_region_size, "(i)i", NULL},
+		{"add", native_add, "(ii*)i", NULL},
+		{"cas", native_cas, "(iii*)i", NULL},
 	};
 
 	if (!wasm_runtime_register_natives("wasp", symbols, ARRAY_SIZE(symbols))) {

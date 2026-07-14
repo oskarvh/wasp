@@ -476,31 +476,37 @@ Phase 2 — ergonomics (**implemented**, verified on Nucleo + Pico W):
       examples and performance guidance (batch, don't peek);
       self-test: `wasp_client.py <ip> remote2 …` (23 checks).
 
-Phase 3 — performance:
+Phase 3 — performance (queueing + atomics **implemented**; measured on
+the 6-node swarm, 150 contended increments):
 
-- [ ] Coordinator-side lock queueing: a `LOCK` on a held region parks
-      the request in a per-region FIFO instead of failing fast with
-      `ERROR(LOCKED)`; the grant is sent when the holder unlocks (or
-      its lease expires). Kills the retry storm — under contention
-      every fail-fast retry is a wasted network round-trip, the lock
-      sits idle while contenders sleep through their backoff, and
-      nothing guarantees fairness (measured: 150 locked increments
-      across 6 nodes = ~1000 `ELOCKED` retries, ~60 s; queued, the
-      same workload is ~4 RPCs per increment with zero retries).
-      Queue entries die with their connection; the lease clock starts
-      at grant, not enqueue; the node's RPC timeout must cover the
-      worst-case queue wait (or `LOCK` gets its own deadline knob).
-- [ ] Atomic RPC primitives: `MEM_ADD` (fetch-and-add) and `MEM_CAS`
-      (compare-and-swap) — the coordinator already serializes each
-      request, so doing the read-modify-write *inside* that window
-      makes it atomic without any lock or lease. A contended counter
-      increment becomes exactly one round-trip per node, ever; the
-      only "queue" left is the coordinator's internal mutex
-      (microseconds, not network milliseconds). Locks remain for
-      multi-word invariants and larger critical sections.
+- [x] Coordinator-side lock queueing: a `LOCK` on a held region parks
+      in a per-region FIFO (bounded wait, then `ERROR(LOCKED)` after
+      all) instead of failing fast; the grant is sent the moment the
+      holder unlocks. Coordinator policy — no node/protocol change.
+      Kills the retry storm: ~1000 wasted `ELOCKED` round-trips →
+      **zero**, with FIFO fairness. Lease clock starts at grant; the
+      parked wait is bounded (4 s) to stay under the node's RPC
+      timeout.
+- [x] Atomic RPC primitives `MEM_ADD` / `MEM_CAS`: the coordinator
+      already serializes each request, so doing the read-modify-write
+      *inside* that window is race-free with no lock and no lease —
+      one round-trip per increment (~10 ms measured). Module API:
+      `wasp_add`/`wasp_cas` (C), `fetch_add`/`compare_exchange` on
+      `remote_ptr<T>` (C++); advertised as feature bit 0x02.
+- [x] RPC latency (found while measuring the above): node-initiated
+      requests waited up to 50 ms in the TX queue for the serve loop's
+      poll tick, and header+payload as two `send()`s stalled on
+      Nagle + delayed ACK. `SERVE_POLL_MS` 50→2 plus `TCP_NODELAY` on
+      both ends ≈ 4× across every remote-memory workload.
 - [ ] Node-side page cache (DTCM candidate) with dirty tracking,
       write-back on unlock/flush, invalidate on lock acquire; cache
       statistics queryable over the protocol.
+
+Measured end to end (`tools/swarm_test.py`, 6 nodes): fail-fast locks
+60 s / ~1000 retries → queued locks 10.2 s / 0 retries → atomic
+`MEM_ADD` **1.5 s** / 0 retries — a 40× improvement on the contended
+counter, with the unlocked-race and distributed-sum phases confirming
+correctness throughout.
 
 Phase 4 — research:
 
@@ -520,7 +526,10 @@ Phase 4 — research:
       [Remote memory — design plan](#remote-memory--design-plan))
 - [x] Remote memory phase 2: transparent dereferencing — `wasp_remote`
       pointers in C (LLVM pass plugin) and `remote_ptr<T>` in C++
-      (header-only); phases 3–4 (caching, un-annotated code) planned
+      (header-only)
+- [x] Remote memory phase 3 (partial): queued locks, atomic
+      `MEM_ADD`/`MEM_CAS`, RPC latency fixes — contended counter 60 s
+      → 1.5 s on the 6-node swarm; node-side caching still open
 - [x] Second board: Raspberry Pi Pico W (RP2040 + CYW43439 WiFi) — full
       suite passing on Ethernet and WiFi nodes simultaneously
 - [x] 6-node swarm (1× Nucleo + 5× Pico W): distributed sum, cross-node

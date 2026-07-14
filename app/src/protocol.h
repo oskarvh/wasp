@@ -46,11 +46,28 @@
  *   MEM_DATA   (c->n): [data × len]
  *   MEM_WRITE  (n->c): [ref u32 LE][data]
  *   MEM_ACK    (c->n): empty (also acks UNLOCK)
- *   LOCK       (n->c): [region_id u8]; held-by-other -> ERROR(LOCKED)
+ *   LOCK       (n->c): [region_id u8]; held-by-other -> ERROR(LOCKED),
+ *                      or the coordinator may park the request and grant
+ *                      when the region frees (queued locks are
+ *                      coordinator policy — the node blocks on the
+ *                      response either way, so it needs no opinion)
  *   LOCK_GRANT (c->n): [lease_ms u32 LE]
  *   UNLOCK     (n->c): [region_id u8]; ack is MEM_ACK
  *   REGION_INFO(n->c): [region_id u8]
  *   REGION_DESC(c->n): [length u32 LE]
+ *
+ * Atomic primitives (feature bit WASP_FEAT_ATOMICS): the coordinator
+ * already serializes each request, so performing the whole
+ * read-modify-write inside that window makes it race-free with no lock
+ * and no lease — one round-trip replaces LOCK/READ/WRITE/UNLOCK. Both
+ * respect a lock held by another node (ERROR(LOCKED)) and answer with
+ * the OLD value:
+ *
+ *   MEM_ADD    (n->c): [ref u32 LE][delta i32 LE]; *ref += delta
+ *   MEM_CAS    (n->c): [ref u32 LE][expected u32 LE][desired u32 LE];
+ *                      writes desired only if *ref == expected — the
+ *                      answered old value tells the node whether it won
+ *   (both answered with MEM_DATA [old value u32 LE])
  */
 #ifndef WASP_PROTOCOL_H_
 #define WASP_PROTOCOL_H_
@@ -89,10 +106,13 @@ enum wasp_msg_type {
 	WASP_MSG_UNLOCK = 0x46,
 	WASP_MSG_REGION_INFO = 0x47,
 	WASP_MSG_REGION_DESC = 0x48,
+	WASP_MSG_MEM_ADD = 0x49,
+	WASP_MSG_MEM_CAS = 0x4A,
 };
 
 /* HELLO_ACK feature bits. */
 #define WASP_FEAT_REMOTE_MEM 0x01
+#define WASP_FEAT_ATOMICS 0x02
 
 /* Remote reference packing: (region_id:8 | offset:24). */
 #define WASP_REF_REGION(ref) ((uint32_t)(ref) >> 24)

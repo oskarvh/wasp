@@ -49,6 +49,28 @@ WASP_IMPORT("unlock") int wasp_unlock(unsigned region);
 WASP_IMPORT("region_size") int wasp_region_size(unsigned region);
 
 /*
+ * Atomic primitives (nodes with feature bit 0x02): the coordinator
+ * performs the whole read-modify-write while servicing the one
+ * request, so these are race-free against every other node with no
+ * lock, no lease, and exactly one round-trip. Both store the OLD value
+ * through *old and return a WASP_REMOTE_* status. They respect
+ * explicit locks (WASP_REMOTE_ELOCKED while another node holds the
+ * region).
+ */
+
+/* *ref += delta (i32). Old value out via *old. */
+WASP_IMPORT("add") int wasp_add(unsigned ref, int delta, int *old);
+
+/*
+ * Write desired to *ref only if it currently equals expected; *old
+ * receives what was there. You won the swap iff *old == expected.
+ * Retry loops cost one round-trip per attempt and only repeat when the
+ * value truly changed underneath you.
+ */
+WASP_IMPORT("cas") int wasp_cas(unsigned ref, unsigned expected, unsigned desired,
+				unsigned *old);
+
+/*
  * --- Phase 2: transparent remote pointers ----------------------------
  *
  * Declare a pointer wasp_remote and dereference it like any other

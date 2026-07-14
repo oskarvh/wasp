@@ -10,7 +10,11 @@ story on real hardware:
   2. racy increments   — unlocked read-modify-write from all nodes
                          loses updates (this failing to lose updates
                          would be suspicious, not reassuring)
-  3. locked increments — same workload under wasp_lock is exact
+  3. contended increments, three strategies back to back on the same
+     workload, so the phase-3 gains are measured not argued:
+       a. fail-fast locks — exact, but pays an ELOCKED retry storm
+       b. queued locks    — coordinator parks LOCKs FIFO; zero retries
+       c. atomic MEM_ADD  — one RPC per increment, no lock at all
 
 Usage:
   swarm_test.py <remote_module.wasm> <node-ip> [<node-ip> ...]
@@ -63,14 +67,17 @@ def main():
         if not ips:
             raise SystemExit("no free nodes discovered")
 
-    # One connection per node; all share the same coordinator memory.
+    # One connection per node; all share the same coordinator memory
+    # (and lock state, including the queued-lock FIFO).
     regions: dict[int, bytearray] = {}
     locks: dict[int, tuple[str, float]] = {}
+    lock_queue: dict[int, list[str]] = {}
     nodes = []
     for ip in ips:
         node = WaspNode(ip, 4242, timeout=15.0, lock_owner=f"node-{ip}")
         node.regions = regions
         node.locks = locks
+        node.lock_queue = lock_queue
         node.hello()
         node.load(wasm)
         nodes.append(node)
@@ -113,11 +120,19 @@ def main():
     if lost == 0:
         print("  (note: no updates lost this run — race not observed)")
 
-    # -- 3: the same workload under wasp_lock is exact ------------------
-    struct.pack_into("<i", regions[2], 0, 0)
-    retries = [0] * len(nodes)
+    # -- 3: the same contended workload, three strategies ---------------
+    def increment_run(name, fn):
+        struct.pack_into("<i", regions[2], 0, 0)
+        retries = [0] * len(nodes)
+        t0 = time.monotonic()
+        per_node(nodes, lambda i, node: fn(i, node, retries))
+        dt = time.monotonic() - t0
+        final = struct.unpack("<i", regions[2])[0]
+        check(f"{name} is exact ({expected} increments -> {final})",
+              final == expected, f"{sum(retries)} ELOCKED retries, {dt:.2f}s")
+        return dt, sum(retries)
 
-    def locked(i, node):
+    def locked(i, node, retries):
         for _ in range(INCREMENTS_PER_NODE):
             while True:
                 r = node.call("locked_add", 2, pack_ref(2), 1)[0]
@@ -127,13 +142,29 @@ def main():
             if r < 0:
                 raise RuntimeError(f"locked_add failed: {r}")
 
-    t0 = time.monotonic()
-    per_node(nodes, locked)
-    dt = time.monotonic() - t0
-    final = struct.unpack("<i", regions[2])[0]
-    check(f"locked RMW is exact ({expected} increments -> {final})",
-          final == expected,
-          f"{sum(retries)} ELOCKED retries, {dt:.2f}s")
+    def atomic(i, node, retries):
+        for _ in range(INCREMENTS_PER_NODE):
+            r = node.call("atomic_add", pack_ref(2), 1)[0]
+            if r < 0:
+                raise RuntimeError(f"atomic_add failed: {r}")
+
+    t_fail, r_fail = increment_run("locked RMW (fail-fast)", locked)
+
+    for node in nodes:
+        node.queue_locks = True
+    t_queue, r_queue = increment_run("locked RMW (queued)", locked)
+    for node in nodes:
+        node.queue_locks = False
+
+    t_atomic, r_atomic = increment_run("atomic MEM_ADD", atomic)
+
+    print(f"\n  contended-increment comparison "
+          f"({expected} increments across {len(nodes)} nodes):")
+    print(f"    fail-fast locks : {t_fail:6.2f}s  {r_fail:5d} retries  (baseline)")
+    print(f"    queued locks    : {t_queue:6.2f}s  {r_queue:5d} retries  "
+          f"({t_fail / t_queue:.1f}x faster)")
+    print(f"    atomic MEM_ADD  : {t_atomic:6.2f}s  {r_atomic:5d} retries  "
+          f"({t_fail / t_atomic:.1f}x faster)\n")
 
     for node in nodes:
         node.unload()
