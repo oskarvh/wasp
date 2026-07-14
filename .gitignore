@@ -12,8 +12,9 @@
 # local WiFi credentials — never committed
 /app/wifi_credentials.conf
 
-# compiled test modules
+# compiled test modules and the LLVM pass plugin
 /tools/*.wasm
+/tools/wasp-remote-pass/*.so
 
 __pycache__/
 *.pyc

@@ -48,4 +48,48 @@ WASP_IMPORT("unlock") int wasp_unlock(unsigned region);
 /* Byte length of an exported region, or a WASP_REMOTE_* error. */
 WASP_IMPORT("region_size") int wasp_region_size(unsigned region);
 
+/*
+ * --- Phase 2: transparent remote pointers ----------------------------
+ *
+ * Declare a pointer wasp_remote and dereference it like any other
+ * pointer; loads, stores, indexing, and whole-struct copies through it
+ * become remote-memory RPCs. Requires compiling with the wasp-remote
+ * pass plugin and linking tools/lib/wasp_remote_rt.c (see
+ * tools/build_test_module.sh); without the plugin, taking one of these
+ * pointers apart still works but dereferencing will fail the build in
+ * the wasm backend rather than miscompile.
+ *
+ *   wasp_remote int *arr = WASP_REMOTE_PTR(int, 1, 0);
+ *   arr[3] = arr[0] + arr[1];      // three RPCs
+ *
+ * A failed dereference (bad region, out of bounds, region locked by
+ * someone else, coordinator gone) traps the module — the remote
+ * equivalent of a segfault, surfaced to the coordinator as
+ * ERROR(TRAP). When an access can legitimately fail — contended locks,
+ * probing region sizes — use the explicit wasp_mem_read/wasp_mem_write
+ * API above and check the return code.
+ *
+ * Address space 100 avoids the LLVM wasm backend's reserved spaces.
+ */
+#define wasp_remote __attribute__((address_space(100)))
+
+/* A typed remote pointer to (region, byte offset). */
+#define WASP_REMOTE_PTR(T, region, offset) \
+	((wasp_remote T *)WASP_REF(region, offset))
+
+/*
+ * Scoped lock guard: the body runs exactly once if the lock was
+ * acquired and not at all otherwise (check wasp_lock() yourself if you
+ * must distinguish). Do not break/goto/return out of the body — the
+ * unlock would be skipped.
+ *
+ *   wasp_locked(REGION) {
+ *       int v = *counter;
+ *       *counter = v + 1;
+ *   }
+ */
+#define wasp_locked(region)                                          \
+	for (int _wasp_lk = (wasp_lock(region) == WASP_REMOTE_OK) ? 0 : 2; \
+	     _wasp_lk == 0; wasp_unlock(region), _wasp_lk = 1)
+
 #endif /* WASP_REMOTE_H_ */

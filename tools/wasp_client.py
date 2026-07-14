@@ -393,6 +393,77 @@ def cmd_remote(node: WaspNode, args):
     print("all remote memory checks passed")
 
 
+def expect_trap(node: WaspNode, func: str, *fargs: int) -> bool:
+    """True if the call trapped the module (remote segfault semantics)."""
+    try:
+        node.call(func, *fargs)
+        return False
+    except ValueError as e:
+        return "TRAP" in str(e)
+
+
+def cmd_remote2(node: WaspNode, args):
+    """Phase-2 ergonomics: transparent pointers (C plugin + C++ header)."""
+    _, _, features = node.hello()
+    check("node advertises remote memory", features & FEAT_REMOTE_MEM,
+          f"features 0x{features:02x}")
+
+    def fresh_regions():
+        node.register_region(1, bytearray(struct.pack("<16i", *range(16))))
+        node.register_region(2, bytearray(range(1, 17)))
+        node.register_region(3, bytearray(struct.pack("<4d", 1.5, 2.5, 3.25, 4.75)))
+        node.register_region(4, bytearray(struct.pack("<2i", 11, 22)))
+        node.register_region(5, bytearray(struct.pack("<i", 100)))
+
+    # --- C: wasp_remote address-space pointers (pass plugin) ----------
+    fresh_regions()
+    node.load(open(args.as_module, "rb").read())
+    print("  [C / wasp_remote address-space pointers]")
+
+    check("indexed loads (i32)", node.call("as_sum", 1, 16) == [120])
+    check("byte loads (i8)", node.call("as_sum_bytes", 2, 16) == [sum(range(1, 17))])
+    check("f64 loads", node.call("as_sum_f64", 3, 4) == [12])
+    check("store + readback", node.call("as_store", 1, 3, 999) == [999])
+    check("store landed in coordinator RAM",
+          struct.unpack_from("<i", node.regions[1], 12)[0] == 999)
+    check("whole-struct copy (bulk RPCs)", node.call("as_swap", 4) == [22]
+          and node.regions[4] == bytearray(struct.pack("<2i", 22, 11)))
+    check("locked increment via wasp_locked guard",
+          node.call("as_locked_inc", 5) == [101]
+          and struct.unpack_from("<i", node.regions[5], 0)[0] == 101)
+    check("lock released by guard", 5 not in node.locks)
+    node.locks[5] = ("rival", time.monotonic() + LOCK_LEASE_S)
+    check("contended guard -> ELOCKED, no trap",
+          node.call("as_locked_inc", 5) == [R_ELOCKED])
+    del node.locks[5]
+    check("out-of-bounds dereference traps", expect_trap(node, "as_oob", 1))
+    check("node survives the trap", node.call("as_sum", 1, 3) == [0 + 1 + 2])
+    node.unload()
+
+    # --- C++: remote_ptr<T> (no plugin) --------------------------------
+    fresh_regions()
+    node.load(open(args.cpp_module, "rb").read())
+    print("  [C++ / remote_ptr<T>]")
+
+    check("indexed loads via remote_ref proxy", node.call("cpp_sum", 1, 16) == [120])
+    check("bulk read via try_read", node.call("cpp_sum_bulk", 1, 16) == [120])
+    check("store via proxy assignment", node.call("cpp_store", 1, 5, 777) == [777]
+          and struct.unpack_from("<i", node.regions[1], 20)[0] == 777)
+    check("operator-> field access", node.call("cpp_pair_b", 4) == [22])
+    check("RAII remote_lock increment", node.call("cpp_locked_inc", 5) == [101])
+    check("lock released by RAII guard", 5 not in node.locks)
+    node.locks[5] = ("rival", time.monotonic() + LOCK_LEASE_S)
+    check("contended RAII lock -> ELOCKED, no trap",
+          node.call("cpp_locked_inc", 5) == [R_ELOCKED])
+    del node.locks[5]
+    check("+= read-modify-write proxy", node.call("cpp_add", 5, 9) == [110])
+    check("out-of-bounds dereference traps", expect_trap(node, "cpp_oob", 1))
+    check("node survives the trap", node.call("cpp_sum", 1, 3) == [0 + 1 + 2])
+    node.unload()
+
+    print("all phase-2 ergonomics checks passed")
+
+
 def cmd_load(node: WaspNode, args):
     node.hello()
     node.load(open(args.module, "rb").read())
@@ -476,6 +547,9 @@ def main():
     p.add_argument("module", help="path to .wasm file")
     p = sub.add_parser("remote", help="remote-memory self-test")
     p.add_argument("module", help="path to remote_module.wasm")
+    p = sub.add_parser("remote2", help="transparent remote pointer self-test")
+    p.add_argument("as_module", help="path to remote_as_module.wasm")
+    p.add_argument("cpp_module", help="path to remote_cpp_module.wasm")
     p = sub.add_parser("load", help="load a module")
     p.add_argument("module", help="path to .wasm file")
     sub.add_parser("unload", help="unload the module")
@@ -494,8 +568,9 @@ def main():
     print(f"connected to {args.host}:{args.port}")
 
     handlers = {"check": cmd_check, "lifecycle": cmd_lifecycle, "remote": cmd_remote,
-                "load": cmd_load, "unload": cmd_unload, "call": cmd_call,
-                "identify": cmd_identify, "reboot": cmd_reboot, None: cmd_check}
+                "remote2": cmd_remote2, "load": cmd_load, "unload": cmd_unload,
+                "call": cmd_call, "identify": cmd_identify, "reboot": cmd_reboot,
+                None: cmd_check}
     handlers[args.cmd](node, args)
 
 

@@ -182,9 +182,14 @@ wasp/
 ├── tools/
 │   ├── wasp_client.py      # test client + remote-memory host (embryonic coordinator)
 │   ├── swarm_test.py       # multi-node concurrency test (race + locks + distributed sum)
-│   ├── include/wasp/remote.h  # module-side remote memory API
+│   ├── include/wasp/remote.h   # module-side remote memory API (C)
+│   ├── include/wasp/remote.hpp # remote_ptr<T> / remote_lock (C++, no plugin)
+│   ├── wasp-remote-pass/   # LLVM pass plugin: lowers wasp_remote dereferences
+│   ├── lib/wasp_remote_rt.c    # runtime shims the pass lowers into
 │   ├── test_module.c       # test WASM module (add/fib/boom)
-│   ├── remote_module.c     # remote-memory test module
+│   ├── remote_module.c     # remote-memory test module (explicit API)
+│   ├── remote_as_module.c  # transparent wasp_remote pointer test module
+│   ├── remote_cpp_module.cpp   # C++ remote_ptr test module
 │   └── build_test_module.sh
 └── README.md
 ```
@@ -445,28 +450,54 @@ Phase 1 — explicit remote memory, end to end (**implemented**):
       with 5–6 real nodes racing), the same workload under `wasp_lock`
       is exact. The concurrency story is proven on hardware.
 
-Phase 2 — ergonomics:
+Phase 2 — ergonomics (**implemented**, verified on Nucleo + Pico W):
 
-- [ ] `wasp/remote.h` for C: `wasp_remote` address-space qualifier,
-      packed-reference helpers, bulk read/write wrappers, lock guard
-      macros — usable stand-alone (explicit calls) before the pass
-      plugin exists.
-- [ ] LLVM pass plugin (`-fpass-plugin=`): lower loads/stores through
-      address space 1 to `__wasp_remote_load/store_*` imports; verify
-      pointer arithmetic, structs, and arrays on packed references;
-      unsupported constructs must be a compile error, never a silent
-      miscompile.
-- [ ] `wasp/remote.hpp` for C++: `remote_ptr<T>` with overloaded
-      `operator*` / `operator->` / `operator[]` and write-through proxy;
-      `remote_lock` RAII guard — same transparency, no compiler plugin
-      needed. Verify clang wasm32 C++ (`-fno-exceptions -fno-rtti
-      -nostdlib`) fits the size budget.
-- [ ] `docs/writing-modules.md`: new chapter with a worked
-      pass-by-reference example and performance guidance (batch, don't
-      peek).
+- [x] `wasp/remote.h` for C: `wasp_remote` address-space qualifier,
+      `WASP_REMOTE_PTR()` helper, `wasp_locked()` scoped lock guard —
+      usable stand-alone (explicit calls) without the pass plugin.
+- [x] LLVM pass plugin (`tools/wasp-remote-pass/`, `-fpass-plugin=`):
+      lowers loads/stores through address space **100** (AS 1/10/20 are
+      reserved by the wasm backend) to `__wasp_remote_load/store_*`
+      shims (`tools/lib/wasp_remote_rt.c` — plain phase-1 imports, no
+      firmware change), and remote↔local `memcpy` to single bulk RPCs,
+      so whole-struct assignment is one round-trip. Pointer arithmetic,
+      indexing, i8→f64 widths verified on hardware; unsupported
+      constructs (remote↔local casts, remote memset, remote-to-remote
+      copies, atomics) fail the compile — never a silent miscompile.
+- [x] `wasp/remote.hpp` for C++: `remote_ptr<T>` with `operator*` /
+      `operator->` / `operator[]` and a write-through proxy,
+      `remote_lock` RAII guard, `try_read`/`try_write` bulk path — no
+      compiler plugin needed. clang wasm32 C++ (`-fno-exceptions
+      -fno-rtti -nostdlib`) output: ~1 KiB module.
+- [x] Failed transparent dereferences trap the module (the "remote
+      segfault"), reported as `ERROR(TRAP)`; expected-failure paths
+      (contended locks) keep using explicit error codes.
+- [x] `docs/writing-modules.md`: chapter with worked C and C++
+      examples and performance guidance (batch, don't peek);
+      self-test: `wasp_client.py <ip> remote2 …` (23 checks).
 
 Phase 3 — performance:
 
+- [ ] Coordinator-side lock queueing: a `LOCK` on a held region parks
+      the request in a per-region FIFO instead of failing fast with
+      `ERROR(LOCKED)`; the grant is sent when the holder unlocks (or
+      its lease expires). Kills the retry storm — under contention
+      every fail-fast retry is a wasted network round-trip, the lock
+      sits idle while contenders sleep through their backoff, and
+      nothing guarantees fairness (measured: 150 locked increments
+      across 6 nodes = ~1000 `ELOCKED` retries, ~60 s; queued, the
+      same workload is ~4 RPCs per increment with zero retries).
+      Queue entries die with their connection; the lease clock starts
+      at grant, not enqueue; the node's RPC timeout must cover the
+      worst-case queue wait (or `LOCK` gets its own deadline knob).
+- [ ] Atomic RPC primitives: `MEM_ADD` (fetch-and-add) and `MEM_CAS`
+      (compare-and-swap) — the coordinator already serializes each
+      request, so doing the read-modify-write *inside* that window
+      makes it atomic without any lock or lease. A contended counter
+      increment becomes exactly one round-trip per node, ever; the
+      only "queue" left is the coordinator's internal mutex
+      (microseconds, not network milliseconds). Locks remain for
+      multi-word invariants and larger critical sections.
 - [ ] Node-side page cache (DTCM candidate) with dirty tracking,
       write-back on unlock/flush, invalidate on lock acquire; cache
       statistics queryable over the protocol.
@@ -486,8 +517,10 @@ Phase 4 — research:
 - [x] WASM module lifecycle (load / call / unload) end to end — i32-only v1 calling convention
 - [x] Remote memory phase 1: modules read/write/lock coordinator RAM via
       `wasp.*` host functions (see
-      [Remote memory — design plan](#remote-memory--design-plan));
-      phases 2–4 (typed transparency, caching, un-annotated code) planned
+      [Remote memory — design plan](#remote-memory--design-plan))
+- [x] Remote memory phase 2: transparent dereferencing — `wasp_remote`
+      pointers in C (LLVM pass plugin) and `remote_ptr<T>` in C++
+      (header-only); phases 3–4 (caching, un-annotated code) planned
 - [x] Second board: Raspberry Pi Pico W (RP2040 + CYW43439 WiFi) — full
       suite passing on Ethernet and WiFi nodes simultaneously
 - [x] 6-node swarm (1× Nucleo + 5× Pico W): distributed sum, cross-node

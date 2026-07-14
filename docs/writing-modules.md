@@ -297,6 +297,109 @@ remote-memory self-test (`python3 tools/wasp_client.py <node-ip> remote
 tools/remote_module.wasm`) exercises all of the above if you want a
 reference transcript.
 
+## Transparent remote pointers (phase 2)
+
+The explicit API above works, but pass-by-reference code shouldn't have
+to be rewritten around `wasp_mem_read` calls. Phase 2 adds two ways to
+just *dereference* coordinator memory. Nothing changes on the node or
+the coordinator — both routes compile down to the same phase-1 host
+functions.
+
+### C: the `wasp_remote` qualifier + compiler plugin
+
+Declare a pointer `wasp_remote` (an address-space qualifier from
+`wasp/remote.h`) and use it like any pointer:
+
+```c
+#include "wasp/remote.h"
+
+__attribute__((export_name("normalize")))
+int normalize(unsigned region, int count)
+{
+    wasp_remote int *v = WASP_REMOTE_PTR(int, region, 0);
+    int max = 1;
+
+    for (int i = 0; i < count; i++)
+        if (v[i] > max)
+            max = v[i];              /* remote loads */
+    for (int i = 0; i < count; i++)
+        v[i] = v[i] * 100 / max;     /* remote load + store */
+    return max;
+}
+```
+
+Indexing, pointer arithmetic, `*p`, struct member access, and
+whole-struct assignment (`struct t x = *rp;` — one bulk RPC, not
+field-by-field) all work. Two build ingredients (see
+`tools/build_test_module.sh` for the exact commands):
+
+```sh
+clang --target=wasm32 -O2 -nostdlib -Itools/include \
+      -fpass-plugin=tools/wasp-remote-pass/libWaspRemotePass.so \
+      -Wl,--no-entry -Wl,--export-dynamic -z stack-size=1024 \
+      -o module.wasm module.c tools/lib/wasp_remote_rt.c
+```
+
+- the **LLVM pass plugin** (`tools/wasp-remote-pass/`, built
+  automatically by `build_test_module.sh`) rewrites every load/store
+  through a `wasp_remote` pointer into a remote-memory call, and
+- `tools/lib/wasp_remote_rt.c` provides the runtime those calls land
+  in.
+
+Anything the plugin cannot lower faithfully — casting a remote pointer
+to a local one, remote `memset`, remote-to-remote `memcpy`, atomics —
+**fails the compile** with a `wasp-remote:` error; there is no
+silent-miscompile mode.
+
+### C++: `remote_ptr<T>`, no plugin at all
+
+C++ operator overloading achieves the same transparency in a plain
+header, `wasp/remote.hpp`:
+
+```cpp
+#include <wasp/remote.hpp>
+
+extern "C" __attribute__((export_name("locked_inc")))
+int locked_inc(unsigned region)
+{
+    wasp::remote_lock lock(region);      // RAII lease
+    if (!lock)
+        return WASP_REMOTE_ELOCKED;      // contended: no trap, report
+
+    wasp::remote_ptr<int> p(region, 0);
+    *p += 1;                             // load + store through proxies
+    return *p;
+}
+```
+
+`remote_ptr<T>` supports `*p`, `p[i]`, `p->field` (loads the whole
+struct once), pointer arithmetic, and bulk `try_read`/`try_write` for
+the batched fast path. Compile with `clang++ --target=wasm32
+-fno-exceptions -fno-rtti -nostdlib` — no plugin, no runtime file.
+
+### Error semantics: the remote segfault
+
+A transparent dereference has no return code, so a failed access —
+out of bounds, unknown region, region locked by another node,
+coordinator gone — **traps the module**, exactly like dereferencing a
+bad local pointer, and surfaces to the coordinator as `ERROR(TRAP)`.
+The node survives; the next call works. Where failure is *expected*
+(lock contention, probing), don't dereference blind: use `wasp_locked`
+/ `remote_lock` and the explicit `wasp_mem_*` API, which report
+`WASP_REMOTE_*` codes instead.
+
+The performance rule doubles in importance here: transparent syntax
+makes it easy to write an RPC per array element without noticing. The
+loops in `normalize()` above cost `2 × count` round-trips —
+per-element access is for small or sparse data, and anything bigger
+should stage through a local buffer (`wasp_mem_read` /
+`try_read`, one RPC per direction).
+
+Reference modules: `tools/remote_as_module.c` (C, every access
+transparent) and `tools/remote_cpp_module.cpp` (C++); self-test:
+`python3 tools/wasp_client.py <node-ip> remote2
+tools/remote_as_module.wasm tools/remote_cpp_module.wasm`.
+
 ## Scripting it
 
 `tools/wasp_client.py` is importable — the same five lines the CLI uses:
