@@ -137,6 +137,12 @@ glance:
 | solid on | coordinator connected |
 | frantic strobe (10 Hz) | `IDENTIFY` received — "here I am" |
 
+Broadcast datagrams do not cross routers, so `ANNOUNCE` discovery is
+LAN-only by nature. Reaching a coordinator on another network is a
+planned expansion (unicast registration to a DNS-resolved coordinator
+hostname — see the roadmap); DNS-based tricks cannot make an actual
+*broadcast* leave the LAN.
+
 ### Memory strategy
 
 WAMR runs from a **static heap pool** (`Alloc_With_Pool`) so WASM memory is
@@ -489,5 +495,19 @@ Phase 4 — research:
 - [x] Fleet ergonomics: status LED, UDP `ANNOUNCE` discovery, `IDENTIFY`
       LED strobe, remote `REBOOT` (incl. RP2040 USB-bootloader entry for
       cable-free reflashing)
+- [ ] WAN discovery — announce to a coordinator outside the LAN.
+      Feasibility checked (2026-07): broadcasts can't leave the LAN, but
+      the same `ANNOUNCE` datagram can be **unicast** to a configured
+      coordinator hostname (`CONFIG_WASP_COORDINATOR_HOST`), resolved
+      on-node with Zephyr's DNS client (`CONFIG_DNS_RESOLVER`;
+      `CONFIG_NET_DHCPV4_OPTION_DNS_ADDRESS` feeds it the DHCP-supplied
+      DNS server automatically — measured cost on the Pico W: ~5 KiB
+      RAM + ~9 KiB flash, fits today). Caveat: a coordinator behind the
+      internet usually can't TCP-connect *back* through the node's NAT,
+      so the follow-on step is a node-initiated "phone home" TCP
+      connection — the wire protocol already runs traffic in both
+      directions over one socket (the 0x4x range), so only who dials
+      changes. mDNS/DNS-SD was considered and rejected: it is
+      link-local, same as broadcast.
 - [ ] Coordinator (separate effort)
 - [ ] More boards

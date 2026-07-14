@@ -49,6 +49,19 @@ config WASP_RPC_TIMEOUT_MS
 	  answer a MEM_READ/MEM_WRITE/LOCK/... request before giving up and
 	  raising a WASM exception on the calling module.
 
+config WASP_WIFI_POWERSAVE
+	bool "Leave WiFi chip power save enabled"
+	depends on WIFI
+	help
+	  The WiFi driver enables chip power save (PM2) by default. That
+	  adds beacon-interval latency bursts to everything that crosses
+	  the radio — remote-memory RPCs, and on the Pico W even status
+	  LED writes (the LED hangs off the WiFi chip), which visibly
+	  mangles the blink patterns. wasp nodes are usually mains/USB
+	  powered, so wasp disables power save after connecting; enable
+	  this only for battery-powered nodes that prefer power over
+	  latency.
+
 config WASP_STATUS_LED
 	bool "Drive a status LED (needs an led0 devicetree alias)"
 	default y

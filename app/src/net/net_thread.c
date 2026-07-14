@@ -87,6 +87,36 @@ static void on_wifi_event(struct net_mgmt_event_callback *cb, uint64_t mgmt_even
 	}
 }
 
+#if defined(CONFIG_WIFI_AIROC) && !defined(CONFIG_WASP_WIFI_POWERSAVE)
+
+#include <whd_wifi_api.h>
+
+extern whd_interface_t airoc_wifi_get_whd_interface(void);
+
+/*
+ * WHD enables chip power save (PM2) at init. The sleep/wake cycle adds
+ * beacon-interval latency bursts to every radio transaction — remote
+ * memory RPCs, and on the Pico W the status LED (a write is a WHD ioctl,
+ * which stalls while the chip sleeps, visibly garbling blink patterns).
+ * Nodes are usually mains-powered, so trade the power back for latency.
+ */
+static void wifi_disable_powersave(void)
+{
+	whd_interface_t ifp = airoc_wifi_get_whd_interface();
+
+	if (ifp == NULL || whd_wifi_disable_powersave(ifp) != WHD_SUCCESS) {
+		LOG_WRN("could not disable WiFi power save");
+	} else {
+		LOG_INF("WiFi power save disabled");
+	}
+}
+
+#else
+static void wifi_disable_powersave(void)
+{
+}
+#endif /* CONFIG_WIFI_AIROC && !CONFIG_WASP_WIFI_POWERSAVE */
+
 /* Join the configured network; retries forever — a node without a
  * network has nothing else to do. */
 static void wifi_connect(struct net_if *iface)
@@ -114,6 +144,7 @@ static void wifi_connect(struct net_if *iface)
 		if (rc == 0 && k_sem_take(&wifi_result, K_SECONDS(30)) == 0 &&
 		    wifi_conn_status == 0) {
 			LOG_INF("WiFi connected");
+			wifi_disable_powersave();
 			return;
 		}
 		LOG_WRN("WiFi connect failed (rc %d, status %d), retrying in 5 s", rc,
