@@ -182,6 +182,7 @@ wasp/
 ├── docs/
 │   ├── writing-modules.md  # C function -> node -> result, step by step
 │   ├── performance.md      # measured remote-memory costs + optimization guide
+│   ├── demo.md             # the distributed Mandelbrot demo, explained
 │   └── diagrams/           # PlantUML sequence diagrams for every protocol scenario
 ├── tools/
 │   ├── wasp_client.py      # test client + remote-memory host (embryonic coordinator)
@@ -192,9 +193,11 @@ wasp/
 │   ├── wasp-remote-pass/   # LLVM pass plugin: lowers wasp_remote dereferences
 │   ├── lib/wasp_remote_rt.c    # runtime shims the pass lowers into
 │   ├── perf_test.py        # remote-memory performance characterization (docs/performance.md)
+│   ├── mandelbrot_demo.py  # distributed-render demo coordinator (docs/demo.md)
 │   ├── test_module.c       # test WASM module (add/fib/boom)
 │   ├── remote_module.c     # remote-memory test module (explicit API)
 │   ├── perf_module.c       # performance-measurement module (driven by perf_test.py)
+│   ├── mandelbrot_module.c # fixed-point Mandelbrot kernel + work-stealing loop
 │   ├── remote_as_module.c  # transparent wasp_remote pointer test module
 │   ├── remote_cpp_module.cpp   # C++ remote_ptr test module
 │   └── build_test_module.sh
@@ -294,6 +297,15 @@ clang --target=wasm32 -O2 -nostdlib -Wl,--no-entry -Wl,--export-dynamic \
 For the full developer walk-through — writing a C function, compiling it,
 pushing it to a node, and reading the result back — see
 **[docs/writing-modules.md](docs/writing-modules.md)**.
+
+To see the whole stack do something at once, run the **distributed
+Mandelbrot demo**: the swarm renders an image into coordinator RAM,
+live in your terminal, self-balancing via an atomic work counter and
+surviving node loss mid-render ([docs/demo.md](docs/demo.md)):
+
+```sh
+python3 tools/mandelbrot_demo.py discover
+```
 
 Note on WAMR integration: WAMR's `zephyr/module.yml` declares external
 CMake/Kconfig glue but does not ship it; `app/modules/wamr/` provides that
@@ -572,6 +584,10 @@ Phase 4 — research:
 - [x] Fleet ergonomics: status LED, UDP `ANNOUNCE` discovery, `IDENTIFY`
       LED strobe, remote `REBOOT` (incl. RP2040 USB-bootloader entry for
       cable-free reflashing)
+- [x] Distributed Mandelbrot demo ([docs/demo.md](docs/demo.md)):
+      work-stealing via `MEM_ADD`, live tile-by-tile terminal view,
+      per-node provenance image, node-loss recovery with work re-issue
+      — 256×192 in 4 s on the 6-node swarm
 - [ ] WAN discovery — announce to a coordinator outside the LAN.
       Feasibility checked (2026-07): broadcasts can't leave the LAN, but
       the same `ANNOUNCE` datagram can be **unicast** to a configured
@@ -586,5 +602,17 @@ Phase 4 — research:
       directions over one socket (the 0x4x range), so only who dials
       changes. mDNS/DNS-SD was considered and rejected: it is
       link-local, same as broadcast.
+- [ ] Multiple WAMR instances per node — on RAM-rich MCUs (RP2350:
+      520 KiB, STM32H7: ~1 MiB, ESP32-S3: up to 8 MiB PSRAM) one
+      physical node could host N module instances and present as N
+      virtual workers. Feasible: WAMR already supports concurrent
+      modules/instances in one runtime, and each instance is
+      independent, so the cost is per-instance RAM (its ≥64 KiB linear
+      memory + stack) plus bounded firmware work — instance handles in
+      `LOAD_MODULE`/`CALL`/`UNLOAD_MODULE`, one executor thread (and
+      exec_env) per running call instead of the single executor, and
+      the node→coordinator RPC slot generalized to a small table keyed
+      by instance. Today's fleet stays single-instance: the Pico W is
+      at ~93% RAM and the F439's pool fits exactly one 64 KiB page.
 - [ ] Coordinator (separate effort)
 - [ ] More boards
