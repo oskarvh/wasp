@@ -1,0 +1,57 @@
+@startuml lock-contention
+title Lock contention — fail-fast, queued grants, lease expiry
+hide footbox
+skinparam shadowing false
+
+participant "Node A" as A
+participant "Coordinator\n(all lock state lives here)" as C
+participant "Node B" as B
+
+== Fail-fast (default): contention is an error, never a silent wait ==
+
+A -> C : LOCK [region 1]
+C --> A : LOCK_GRANT [lease_ms]
+
+B -> C : MEM_WRITE [ref in region 1][bytes]
+C --> B : ERROR [LOCKED]
+note right of B : module sees WASP_REMOTE_ELOCKED\n— retry or back off
+
+B -> C : LOCK [region 1]
+C --> B : ERROR [LOCKED]
+
+A -> C : UNLOCK [region 1]
+C --> A : MEM_ACK
+
+B -> C : LOCK [region 1] (retry)
+C --> B : LOCK_GRANT [lease_ms]
+
+== Queued locks (coordinator policy — WaspNode(queue_locks=True)) ==
+
+A -> C : LOCK [region 1]
+C --> A : LOCK_GRANT [lease_ms]
+
+B -> C : LOCK [region 1]
+note over C
+  Instead of failing fast, the coordinator
+  **parks** B's request in the region's FIFO.
+  B's executor just blocks on its RPC slot —
+  the node needs no opinion, no protocol change.
+  The wait is bounded (4 s < the node's 5 s
+  RPC timeout), then ERROR [LOCKED] after all.
+end note
+
+A -> C : UNLOCK [region 1]
+C --> A : MEM_ACK
+C --> B : LOCK_GRANT [lease_ms]\n(sent the moment the region frees;\nthe lease clock starts **now**)
+note right of B : zero wasted round-trips,\nFIFO fairness under contention
+
+== Lease expiry: a dead node cannot deadlock the swarm ==
+
+A -> C : LOCK [region 1]
+C --> A : LOCK_GRANT [lease_ms = 5000]
+A -> A : crashes / loses power\nstill "holding" the lock
+...lease expires (5 s)...
+B -> C : LOCK [region 1]
+note over C : lease expired — the coordinator\nrevokes A's stale hold
+C --> B : LOCK_GRANT [lease_ms]
+@enduml

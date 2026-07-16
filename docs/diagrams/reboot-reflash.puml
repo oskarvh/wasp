@@ -1,0 +1,37 @@
+@startuml reboot-reflash
+title REBOOT — remote reset & cable-free Pico W reflashing
+hide footbox
+skinparam shadowing false
+
+actor "Operator" as O
+participant "Coordinator\n(wasp_client.py)" as C
+participant "Node" as N
+
+== Plain reboot (any board): mode 0 ==
+
+O -> C : wasp_client.py <ip> reboot
+C -> N : REBOOT [mode = 0]
+N --> C : RESULT (empty ack)\n**acked first** — then reboot ~500 ms later
+N -> N : sys_reboot(COLD)
+...node boots, joins the network, DHCP...
+N ->> C : ANNOUNCE resumes (UDP :4243)
+
+== Reflash without touching BOOTSEL (RP2040 only): mode 1 ==
+
+O -> C : wasp_client.py <ip> reboot --bootsel
+C -> N : REBOOT [mode = 1]
+N --> C : RESULT (empty ack)
+N -> N : reset_usb_boot(0, 0)\n→ ROM USB bootloader
+note over N : the **RPI-RP2** mass-storage drive\nenumerates on the USB host
+O -> N : cp build/pico/zephyr/zephyr.uf2\n   /media/$USER/RPI-RP2/
+N -> N : flashes itself, reboots\ninto the new firmware
+...~20 s...
+N ->> C : ANNOUNCE (new firmware online)
+note right of O : the BOOTSEL-button dance is only\nneeded for the very first flash\n(or a bricked board)
+
+== mode 1 on a board with no USB bootloader ==
+
+C -> N : REBOOT [mode = 1] (e.g. the Nucleo)
+N --> C : ERROR [UNSUPPORTED,\n"no bootloader entry on this SoC"]
+note right of C : the node does **not** reboot —\nuse mode 0 and west flash instead
+@enduml

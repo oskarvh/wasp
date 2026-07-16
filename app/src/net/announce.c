@@ -36,7 +36,7 @@ static void announce_thread_fn(void *a, void *b, void *c)
 	pkt[1] = WASP_PROTO_MAGIC1;
 	pkt[2] = WASP_MSG_ANNOUNCE;
 	pkt[3] = WASP_PROTO_VERSION;
-	pkt[4] = WASP_FEAT_REMOTE_MEM;
+	pkt[4] = WASP_FEAT_REMOTE_MEM | WASP_FEAT_ATOMICS;
 	sys_put_le16(CONFIG_WASP_AGENT_PORT, &pkt[5]);
 	pkt[8] = sizeof(ANNOUNCE_BOARD) - 1;
 	memcpy(&pkt[9], ANNOUNCE_BOARD, sizeof(ANNOUNCE_BOARD) - 1);

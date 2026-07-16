@@ -1,0 +1,65 @@
+@startuml session
+title Coordinator session — handshake, liveness, module lifecycle
+hide footbox
+skinparam shadowing false
+
+participant "Coordinator" as C
+box "wasp node"
+participant "network\nhandler" as N
+participant "agent" as A
+participant "wasm\nexecutor" as E
+end box
+
+== Connect & handshake ==
+
+C -> N : TCP connect :4242
+note over N : LED goes solid;\nANNOUNCE now says ""busy""
+C -> N : HELLO [proto v1]
+N -> A : rx msgq
+A --> N : tx msgq
+N --> C : HELLO_ACK [v1][max payload u32]\n[features: 0x01 remote mem | 0x02 atomics]
+
+== Liveness ==
+
+C -> N : PING [any payload]
+N -> A : rx msgq
+A --> N : tx msgq
+N --> C : PONG [same payload echoed]
+
+== Load a module ==
+
+C -> N : LOAD_MODULE [.wasm binary]
+N -> A : rx msgq
+A -> E : exec queue\n(payload ownership moves)
+E -> E : WAMR load + instantiate
+E --> N : tx msgq
+N --> C : RESULT (empty ack)
+
+== Call an exported function ==
+
+C -> N : CALL [name_len]["fib"][argc=1][20]
+N -> A : rx msgq
+A -> E : exec queue
+E -> E : wasm_runtime_call_wasm\n(signature checked: i32 only)
+E --> N : tx msgq
+N --> C : RESULT [nresults=1][6765]
+note right of C
+  The module stays loaded — statics keep
+  their values — until UNLOAD_MODULE,
+  a replacement, or a node reboot.
+end note
+
+== Unload ==
+
+C -> N : UNLOAD_MODULE
+N -> A : rx msgq
+A -> E : exec queue
+E -> E : teardown, free pool memory
+E --> N : tx msgq
+N --> C : RESULT (empty ack)
+
+== Disconnect ==
+
+C -> N : TCP close
+note over N : LED back to heartbeat;\nANNOUNCE says ""free"" again
+@enduml

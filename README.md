@@ -71,7 +71,8 @@ alongside these.
 Length-prefixed binary frames over a single TCP connection (default port
 `4242`, configurable via Kconfig). Canonical definition:
 `app/src/protocol.h`; reference implementation of the coordinator side:
-`tools/wasp_client.py`.
+`tools/wasp_client.py`. Sequence diagrams for every command and failure
+path: [docs/diagrams/](docs/diagrams/README.md).
 
 ```
 ┌────────┬────────┬───────────┬─────────────┬───────────┐
@@ -179,7 +180,9 @@ wasp/
 │   ├── zephyr/
 │   └── modules/            # hal_stm32, cmsis, wasm-micro-runtime, …
 ├── docs/
-│   └── writing-modules.md  # C function -> node -> result, step by step
+│   ├── writing-modules.md  # C function -> node -> result, step by step
+│   ├── performance.md      # measured remote-memory costs + optimization guide
+│   └── diagrams/           # PlantUML sequence diagrams for every protocol scenario
 ├── tools/
 │   ├── wasp_client.py      # test client + remote-memory host (embryonic coordinator)
 │   ├── swarm_test.py       # multi-node concurrency test (distributed sum, race,
@@ -188,8 +191,10 @@ wasp/
 │   ├── include/wasp/remote.hpp # remote_ptr<T> / remote_lock (C++, no plugin)
 │   ├── wasp-remote-pass/   # LLVM pass plugin: lowers wasp_remote dereferences
 │   ├── lib/wasp_remote_rt.c    # runtime shims the pass lowers into
+│   ├── perf_test.py        # remote-memory performance characterization (docs/performance.md)
 │   ├── test_module.c       # test WASM module (add/fib/boom)
 │   ├── remote_module.c     # remote-memory test module (explicit API)
+│   ├── perf_module.c       # performance-measurement module (driven by perf_test.py)
 │   ├── remote_as_module.c  # transparent wasp_remote pointer test module
 │   ├── remote_cpp_module.cpp   # C++ remote_ptr test module
 │   └── build_test_module.sh
@@ -532,6 +537,11 @@ wall-clock gain is deliberately modest — a lock-serialized workload is
 bounded by hold time regardless — its real value is deleting ~800
 garbage round-trips, FIFO fairness, and traffic that no longer grows
 with contention.
+
+A full performance characterization — per-RPC cost on both transports,
+batching, alignment, layout pitfalls, lock partitioning, `MEM_ADD` vs
+CAS scaling — lives in [docs/performance.md](docs/performance.md)
+(`tools/perf_test.py` + `tools/perf_module.c`).
 
 Phase 4 — research:
 

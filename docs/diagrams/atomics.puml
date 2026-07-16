@@ -1,0 +1,47 @@
+@startuml atomics
+title Atomic primitives — MEM_ADD / MEM_CAS (feature 0x02)
+hide footbox
+skinparam shadowing false
+
+participant "Node A" as A
+participant "Coordinator\n(serializes every request)" as C
+participant "Node B" as B
+
+== MEM_ADD: read-modify-write in one round-trip ==
+
+note over C : counter at ""ref"" is 42
+
+A -> C : MEM_ADD [ref u32][delta = +1]
+note over C : *ref += 1 happens **inside** the\ncoordinator's serialization window\n— no lock, no lease, race-free
+C --> A : MEM_DATA [old = 42]
+
+B -> C : MEM_ADD [ref][+1]
+C --> B : MEM_DATA [old = 43]
+note right of B
+  One round-trip replaces
+  LOCK / READ / WRITE / UNLOCK —
+  measured 1.5 s vs 10.2 s (queued
+  locks) for 150 contended
+  increments on the 6-node swarm.
+end note
+
+== MEM_CAS: optimistic update, the old value says who won ==
+
+note over C : value at ""ref"" is 44
+
+A -> C : MEM_CAS [ref][expected = 44][desired = 100]
+C --> A : MEM_DATA [old = 44]
+note right of A : old == expected → **won**;\n44 → 100 was written
+
+B -> C : MEM_CAS [ref][expected = 44][desired = 200]
+C --> B : MEM_DATA [old = 100]
+note right of B : old ≠ expected → **lost**, memory\nuntouched; re-read, recompute,\nCAS again
+
+== Both respect explicit locks ==
+
+B -> C : LOCK [region]
+C --> B : LOCK_GRANT [lease_ms]
+A -> C : MEM_ADD [ref in that region][+1]
+C --> A : ERROR [LOCKED]
+note right of A : module sees WASP_REMOTE_ELOCKED —\natomics compose with lock-based code
+@enduml

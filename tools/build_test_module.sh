@@ -42,5 +42,6 @@ build_cpp() {
 
 build test_module
 build remote_module
+build perf_module
 build_as remote_as_module
 build_cpp remote_cpp_module

@@ -1,0 +1,60 @@
+@startuml remote-memory
+title Remote memory — node-initiated RPCs mid-CALL (feature 0x01)
+hide footbox
+skinparam shadowing false
+
+participant "Coordinator\n(owns the regions)" as C
+box "wasp node"
+participant "network + agent" as N
+participant "executor\n(module running)" as E
+end box
+
+C -> N : CALL "scale" [ref][n][k]\n(coordinator's seq space)
+N -> E : exec queue
+activate E
+
+note over C, E
+  From here the roles reverse: the **node** asks, the coordinator answers.
+  0x4x requests use the node's own seq space, so both directions share the
+  one TCP connection without ambiguity. Each request below transits the tx
+  queue and blocks the executor on the RPC slot until the reply is routed
+  back (or CONFIG_WASP_RPC_TIMEOUT_MS expires).
+end note
+
+E -> C : REGION_INFO [region]
+C --> E : REGION_DESC [length u32]
+
+E -> C : LOCK [region]
+C --> E : LOCK_GRANT [lease_ms u32]
+note right of C : lock state lives **only** here;\nthe grant is a lease — it expires\nif the node dies holding it
+
+E -> C : MEM_READ [ref u32][len u32]
+C --> E : MEM_DATA [len bytes]
+note right of C : bounds-checked on the node first,\nthen authoritatively here
+
+E -> E : compute: buf[i] *= k
+
+E -> C : MEM_WRITE [ref u32][bytes]
+C --> E : MEM_ACK
+note right of C : the write lands directly in the\ncoordinator's registered bytearray
+
+E -> C : UNLOCK [region]
+C --> E : MEM_ACK
+
+E --> N : tx msgq
+deactivate E
+N --> C : RESULT [WASP_REMOTE_OK]\n(answers the CALL's seq)
+
+== If the coordinator goes silent mid-call ==
+
+C -> N : CALL "scale" …
+N -> E : exec queue
+activate E
+E -> C : MEM_READ [ref][len]
+...CONFIG_WASP_RPC_TIMEOUT_MS (5 s) passes, no reply...
+E -> E : host call raises a WASM exception\n— the module **traps**
+E --> N : tx msgq
+deactivate E
+N --> C : ERROR [TRAP, "wasp: remote memory RPC failed"]
+note over N : the node carries on; a hung\ncoordinator can never wedge it
+@enduml

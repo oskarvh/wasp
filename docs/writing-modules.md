@@ -307,12 +307,23 @@ node, in **one round-trip** (nodes advertise them as feature bit
 
 ```c
 int old;
-wasp_add(ref, 1, &old);                  /* atomic *ref += 1; old value out */
+if (wasp_add(ref, 1, &old) != WASP_REMOTE_OK)   /* atomic *ref += 1 */
+        return WASP_REMOTE_ELOCKED;             /* e.g. rival holds the lock */
+/* OK means the add already happened on the coordinator; old = pre-add value */
 
 unsigned seen;
-wasp_cas(ref, expected, desired, &seen); /* write desired iff *ref == expected */
-if (seen == expected) { /* won the swap */ }
+if (wasp_cas(ref, expected, desired, &seen) != WASP_REMOTE_OK)
+        return WASP_REMOTE_ELOCKED;
+if (seen == expected) { /* won the swap: desired was written */ }
 ```
+
+The read-modify-write runs **on the coordinator**, not on the node —
+the node sends one request and the coordinator answers with the old
+value after the update is already done, so there is no window for
+another node to interleave. A non-`OK` return (region locked by
+another node, bad reference) means memory was not touched — and
+neither was the out-parameter, so check the return code before using
+`old`/`seen`.
 
 `wasp_cas` covers arbitrary small updates: read the value, compute the
 new one, CAS it back, and repeat only if another node really did change
@@ -328,12 +339,14 @@ counter (150 increments): fail-fast locks took 13.6 s with ~800
 retries; `wasp_add` took **1.5 s** — reach for a lock only when an
 invariant genuinely spans multiple words or operations.
 
-One performance rule: **every call is a network round-trip** (~ms,
-about a million times slower than local memory). Move data in bulk —
-one 64-byte read beats sixteen 4-byte reads sixteen-fold. The
-remote-memory self-test (`python3 tools/wasp_client.py <node-ip> remote
-tools/remote_module.wasm`) exercises all of the above if you want a
-reference transcript.
+One performance rule: **every call is a network round-trip** (~3 ms on
+Ethernet, ~24 ms on WiFi — about a million times slower than local
+memory). Move data in bulk — a 1 KiB read costs the same as a 4-byte
+read, so batching wins by the element count. Measured costs, layout
+pitfalls, and a when-to-use-what cheat sheet: [performance.md](performance.md).
+The remote-memory self-test (`python3 tools/wasp_client.py <node-ip>
+remote tools/remote_module.wasm`) exercises all of the above if you
+want a reference transcript.
 
 ## Transparent remote pointers (phase 2)
 
@@ -468,5 +481,6 @@ scripts fail loudly.
   README's *Remote memory* section for the model.
 - Function names ≤ 63 bytes; modules ≤ 32 KiB.
 
-The wire format behind all of this is documented in the top-level README
-and defined in `app/src/protocol.h`.
+The wire format behind all of this is documented in the top-level
+README and defined in `app/src/protocol.h`; sequence diagrams of every
+command and failure path live in [diagrams/](diagrams/README.md).

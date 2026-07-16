@@ -1,0 +1,31 @@
+@startuml discovery
+title Discovery & locating a board — ANNOUNCE (UDP) + IDENTIFY
+hide footbox
+skinparam shadowing false
+
+participant "Coordinator\n(wasp_client.py discover)" as C
+participant "Node A\n10.0.0.181" as A
+participant "Node B\n10.0.0.183" as B
+
+== Presence: UDP broadcast to :4243, every 5 s ==
+
+A ->> C : ANNOUNCE\n['W']['A'][0x0C][ver][features]\n[tcp port u16][busy][board_len][board]
+B ->> C : ANNOUNCE
+note right of C
+  ""discover"" listens for a few intervals and
+  keys nodes by **source IP**. ""busy"" = a
+  coordinator is connected right now.
+  Broadcasts never cross a router — this
+  is LAN-only (WAN unicast is on the roadmap).
+end note
+...every 5 s, forever — no coordinator required...
+
+== Which physical board is 10.0.0.181? ==
+
+C -> A : TCP :4242 — IDENTIFY [duration_s = 10]
+A --> C : RESULT (empty ack)
+note over A
+  status LED strobes at 10 Hz for 10 s
+  — "here I am"; normal pattern resumes
+end note
+@enduml

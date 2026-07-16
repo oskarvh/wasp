@@ -1,0 +1,47 @@
+@startuml errors
+title Failure paths — every failure is a one-frame ERROR answer
+hide footbox
+skinparam shadowing false
+
+participant "Coordinator" as C
+participant "Node" as N
+
+== Load-time errors ==
+
+C -> N : LOAD_MODULE (module already loaded)
+N --> C : ERROR [BUSY]
+note right of C : unload first — loading over\na loaded module is rejected
+
+C -> N : LOAD_MODULE, len > CONFIG_WASP_MAX_MODULE_SIZE
+note over N : network handler **drains** the oversized\nframe — stream sync is never lost
+N --> C : ERROR [TOO_LARGE]
+
+C -> N : LOAD_MODULE [invalid wasm, or imports\noutside the ""wasp"" namespace]
+N --> C : ERROR [LOAD_FAILED, WAMR's diagnostic text]
+
+== Call-time errors ==
+
+C -> N : CALL "fib" (nothing loaded)
+N --> C : ERROR [NO_MODULE]
+
+C -> N : CALL "gdc" (typo / missing export_name)
+N --> C : ERROR [NO_FUNC "gdc"]
+
+C -> N : CALL "fib" — wrong argc, or the\nC signature isn't all-i32
+N --> C : ERROR [BAD_ARGS, detail]
+
+C -> N : CALL "boom" — module hits ""unreachable"",\nOOB access, __builtin_trap(), remote segfault…
+N --> C : ERROR [TRAP, exception text]
+note over N
+  The sandbox holds: the module stays
+  loaded, the node is unharmed, and
+  the next CALL works.
+end note
+
+== Stream desync ==
+
+C -> N : bytes that don't start 'W' 'A'
+note over N : bad magic means the stream is\ndesynchronized — unrecoverable
+N --> C : TCP close
+note right of C : reconnect and start over\nwith HELLO
+@enduml

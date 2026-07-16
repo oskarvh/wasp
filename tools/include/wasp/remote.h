@@ -58,14 +58,21 @@ WASP_IMPORT("region_size") int wasp_region_size(unsigned region);
  * region).
  */
 
-/* *ref += delta (i32). Old value out via *old. */
+/*
+ * *ref += delta (i32), performed by the coordinator inside its
+ * serialization window — the node never sees the intermediate value.
+ * WASP_REMOTE_OK means the add already happened; *old receives the
+ * pre-add value. On any failure (ELOCKED, EBOUNDS, ...) memory and
+ * *old are both untouched — check the return before reading *old.
+ */
 WASP_IMPORT("add") int wasp_add(unsigned ref, int delta, int *old);
 
 /*
  * Write desired to *ref only if it currently equals expected; *old
  * receives what was there. You won the swap iff *old == expected.
  * Retry loops cost one round-trip per attempt and only repeat when the
- * value truly changed underneath you.
+ * value truly changed underneath you. As with wasp_add, a non-OK
+ * return leaves memory and *old untouched.
  */
 WASP_IMPORT("cas") int wasp_cas(unsigned ref, unsigned expected, unsigned desired,
 				unsigned *old);
