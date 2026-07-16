@@ -89,6 +89,7 @@ the connection.
 Command set:
 
 - `HELLO` / `HELLO_ACK` — version exchange; ack carries the payload cap
+  and feature bits (`0x01` remote memory, `0x02` atomic primitives)
 - `LOAD_MODULE` — payload is a `.wasm` binary; node loads + instantiates it
   (one module at a time; ack is an empty `RESULT`)
 - `UNLOAD_MODULE` — tears the module down and frees its memory
@@ -104,10 +105,10 @@ Command set:
 - `REBOOT` — remote reboot; mode 1 enters the USB bootloader (RP2040
   only), so Pico Ws can be reflashed without touching BOOTSEL:
   `wasp_client.py <ip> reboot [--bootsel]`
-- `MEM_READ` / `MEM_WRITE` / `LOCK` / `UNLOCK` / `REGION_INFO` (0x4x) —
-  **node-initiated** remote-memory requests, sent mid-`CALL` in the
-  node's own seq space and answered by the coordinator; see
-  [Remote memory](#remote-memory--design-plan)
+- `MEM_READ` / `MEM_WRITE` / `LOCK` / `UNLOCK` / `REGION_INFO` /
+  `MEM_ADD` / `MEM_CAS` (0x4x) — **node-initiated** remote-memory
+  requests, sent mid-`CALL` in the node's own seq space and answered by
+  the coordinator; see [Remote memory](#remote-memory--design-plan)
 
 A module that traps (e.g. `unreachable`, out-of-bounds access) returns
 `ERROR(TRAP, exception-text)` and the node carries on — the WASM sandbox
@@ -181,7 +182,8 @@ wasp/
 │   └── writing-modules.md  # C function -> node -> result, step by step
 ├── tools/
 │   ├── wasp_client.py      # test client + remote-memory host (embryonic coordinator)
-│   ├── swarm_test.py       # multi-node concurrency test (race + locks + distributed sum)
+│   ├── swarm_test.py       # multi-node concurrency test (distributed sum, race,
+│   │                       #   fail-fast vs queued locks vs atomic MEM_ADD)
 │   ├── include/wasp/remote.h   # module-side remote memory API (C)
 │   ├── include/wasp/remote.hpp # remote_ptr<T> / remote_lock (C++, no plugin)
 │   ├── wasp-remote-pass/   # LLVM pass plugin: lowers wasp_remote dereferences
@@ -300,9 +302,10 @@ This is **software distributed shared memory**: when a module needs data
 that lives in the *coordinator's* RAM, the node fetches (or writes back)
 that memory over the wire on the module's behalf — so C code can work
 with pass-by-reference data whose backing store is on another machine.
-Phase 1 (explicit `wasp_mem_read`/`wasp_mem_write`/`wasp_lock` host
-functions — see `tools/include/wasp/remote.h`) is implemented and tested
-on hardware; the later phases below are the plan.
+Phases 1 and 2 (explicit host functions, then transparent remote
+pointers) plus most of phase 3 (queued locks, atomic primitives) are
+implemented and tested on hardware; the checklists below track the
+details, and phase 4 is research.
 
 ### Can we overload the dereference?
 
@@ -319,14 +322,14 @@ itself. What we can do, in increasing order of transparency:
    on it.
 2. **Compile-time typed transparency for C (phase 2)** — clang's named
    address spaces put "this pointer is remote" into the *type system*:
-   `#define wasp_remote __attribute__((address_space(1)))`, then
+   `#define wasp_remote __attribute__((address_space(100)))`, then
    `wasp_remote int *arr` reads like a normal pointer (`arr[i]`,
    `p->field`, pointer arithmetic) but is a distinct type — assigning it
    to a local pointer without an explicit cast is a **compile error**,
    so local/remote confusion is caught at build time and propagated
    automatically through every assignment, argument, and dereference. A
    small LLVM pass plugin (`-fpass-plugin=`) rewrites loads/stores
-   through address space 1 into `__wasp_remote_load/store` calls, which
+   through that address space into `__wasp_remote_load/store` calls, which
    are ordinary WASM imports: the emitted module is plain, valid wasm32,
    and code using only local pointers compiles exactly as before, zero
    overhead. C++ gets the same ergonomics with no compiler plugin at
@@ -375,7 +378,7 @@ coordinator and block until the reply arrives. That needs:
 - **Protocol v2**: a node-initiated message range (`MEM_READ`,
   `MEM_WRITE`, `LOCK`, `UNLOCK` + their acks) with its own seq space, so
   both directions can be in flight on the one TCP connection without
-  ambiguity. Feature-negotiated in `HELLO` so old clients keep working.
+  ambiguity. Advertised as feature bits in `HELLO_ACK`.
 - **An RPC slot in the firmware**: executor posts the request to the tx
   queue and blocks on a semaphore; the agent routes the coordinator's
   reply back to the slot. Executor is serialized, so exactly one
@@ -402,17 +405,24 @@ region is locked; it only sends requests. Concretely:
   expires and the coordinator revokes it.
 - **Enforced, not advisory.** While node A holds a region's lock, a
   read or write from anyone else **fails fast** with `ERROR(LOCKED)` —
-  it neither interleaves silently nor blocks. (Blocking would stall the
-  other node's executor invisibly mid-WASM-call; a fast error lets that
-  module retry or take the lock properly.)
+  it neither interleaves silently nor blocks. (Blocking a plain access
+  would stall the other node's executor invisibly mid-WASM-call; a fast
+  error lets that module retry or take the lock properly.) A contended
+  `LOCK` *request* is the exception: the coordinator may park it in a
+  per-region FIFO and grant it when the holder unlocks — see the
+  phase-3 notes below.
+- **Single-word read-modify-writes don't need a lock at all**: the
+  `MEM_ADD` / `MEM_CAS` primitives do the whole update inside the
+  coordinator's serialization window, one round-trip, race-free
+  against every other node.
 
-Consistency model: phase 1 is *no caching* — every access is a
+Consistency model: today there is *no caching* — every access is a
 round-trip, so it is sequentially consistent and slow (~ms per access vs
-ns locally; the API shape pushes users toward bulk transfers). Phase 3
-adds a node-side page cache with **release consistency**: acquire a lock
-→ invalidate cached pages of that region; release → write back dirty
-pages. That is the classic DSM trade (IVY/TreadMarks lineage) and it is
-where the real performance lives.
+ns locally; the API shape pushes users toward bulk transfers). Phase 3's
+remaining item is a node-side page cache with **release consistency**:
+acquire a lock → invalidate cached pages of that region; release → write
+back dirty pages. That is the classic DSM trade (IVY/TreadMarks lineage)
+and it is where the real performance lives.
 
 ### Implementation todo list
 
@@ -502,11 +512,26 @@ the 6-node swarm, 150 contended increments):
       write-back on unlock/flush, invalidate on lock acquire; cache
       statistics queryable over the protocol.
 
-Measured end to end (`tools/swarm_test.py`, 6 nodes): fail-fast locks
-60 s / ~1000 retries → queued locks 10.2 s / 0 retries → atomic
-`MEM_ADD` **1.5 s** / 0 retries — a 40× improvement on the contended
-counter, with the unlocked-race and distributed-sum phases confirming
-correctness throughout.
+Measured end to end (`tools/swarm_test.py`, 2026-07-13): 150 increments
+of one shared counter, contended by all 6 nodes (1× Nucleo-F439ZI +
+5× Pico W), each strategy run back to back on the same hardware:
+
+| strategy | time | `ELOCKED` retries |
+| --- | --- | --- |
+| fail-fast locks, before latency fixes | 60.8 s | 1038 |
+| fail-fast locks, after latency fixes | 13.6 s | 783 |
+| queued locks | 10.2 s | **0** |
+| atomic `MEM_ADD` | **1.5 s** | **0** |
+
+40× total on the contended counter; the latency fixes alone also cut
+the *uncontended* distributed-sum phase from 0.70 s to 0.22 s. Two
+readings worth keeping: measuring in stages is what exposed the TX-poll
+bottleneck at all (queueing looked like a modest 1.3× until the real
+cost was traced to the serve loop, not the locks); and queued locks'
+wall-clock gain is deliberately modest — a lock-serialized workload is
+bounded by hold time regardless — its real value is deleting ~800
+garbage round-trips, FIFO fairness, and traffic that no longer grows
+with contention.
 
 Phase 4 — research:
 

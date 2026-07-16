@@ -88,8 +88,8 @@ serial cable is needed — just listen:
 
 ```sh
 $ python3 tools/wasp_client.py discover
-10.0.0.154:4242  v1  features=0x01  free  nucleo_f439zi/stm32f439xx
-10.0.0.181:4242  v1  features=0x01  free  rpi_pico/rp2040/w
+10.0.0.154:4242  v1  features=0x03  free  nucleo_f439zi/stm32f439xx
+10.0.0.181:4242  v1  features=0x03  free  rpi_pico/rp2040/w
 ```
 
 `free`/`busy` tells you whether a coordinator is already connected. With
@@ -166,18 +166,19 @@ Three parties are involved; here is what each one needs.
 
 ### On the node: nothing
 
-The firmware ships the host functions. A node that supports them
-advertises feature bit `0x01` in its handshake — visible in the `check`
-output:
+The firmware ships the host functions. A node advertises what it
+supports as feature bits in its handshake — `0x01` remote memory,
+`0x02` the atomic primitives — visible in the `check` output:
 
 ```
-  [ok] HELLO -> HELLO_ACK: v1, max payload 32768 B, features 0x01
+  [ok] HELLO -> HELLO_ACK: v1, max payload 32768 B, features 0x03
 ```
 
 ### In the module: include the header, use the API
 
-Include `wasp/remote.h` (in `tools/include/`) — five functions, all
-returning `WASP_REMOTE_OK` (0) or a negative error:
+Include `wasp/remote.h` (in `tools/include/`). The core API is five
+functions, all returning `WASP_REMOTE_OK` (0) or a negative error
+(plus two atomic primitives, covered further down):
 
 | Function | Does |
 | -------- | ---- |
@@ -272,9 +273,14 @@ observe a torn read or write. Take the lock only around **compound**
 operations (read-modify-write, multi-field updates), like `scale()`
 above. Locks are leases: if a node dies while holding one, the
 coordinator revokes it when the lease expires (5 s in the test client).
-While someone else holds a region's lock, *everything* — reads, writes,
-lock attempts — fails fast with `WASP_REMOTE_ELOCKED` rather than
-blocking; retry or back off in the module.
+While someone else holds a region's lock, reads and writes fail fast
+with `WASP_REMOTE_ELOCKED` rather than blocking. A contended `wasp_lock`
+does the same by default, but the coordinator may instead queue it
+(`WaspNode(queue_locks=True)` in the test client): the request parks in
+a per-region FIFO and the grant arrives the moment the holder unlocks —
+no retry loop in the module, no change to module code. The queued wait
+is bounded (4 s, under the node's 5 s RPC timeout), after which it too
+returns `WASP_REMOTE_ELOCKED`.
 
 | Code | Meaning / fix |
 | ---- | ------------- |
@@ -317,8 +323,8 @@ as `p.fetch_add(n)` and `p.compare_exchange(expected, desired)`.
 Both primitives respect explicit locks (they fail with
 `WASP_REMOTE_ELOCKED` while another node holds the region), so they
 compose with lock-based code. Measured on a 6-node swarm hammering one
-counter (150 increments): fail-fast locks took 60 s with ~1000
-`ELOCKED` retries; coordinator-queued locks took 10 s with zero
+counter (150 increments): fail-fast locks took 13.6 s with ~800
+`ELOCKED` retries; coordinator-queued locks took 10.2 s with zero
 retries; `wasp_add` took **1.5 s** — reach for a lock only when an
 invariant genuinely spans multiple words or operations.
 
