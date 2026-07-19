@@ -183,9 +183,18 @@ wasp/
 │   ├── writing-modules.md  # C function -> node -> result, step by step
 │   ├── performance.md      # measured remote-memory costs + optimization guide
 │   ├── demo.md             # the distributed Mandelbrot demo, explained
+│   ├── hardware.md         # design notes for a future purpose-built node board
+│   ├── coordinator.md      # libwasp C library + peer load-sharing design sketch
 │   └── diagrams/           # PlantUML sequence diagrams for every protocol scenario
+├── libwasp/                # the coordinator as a C library (docs/coordinator.md)
+│   ├── include/wasp/libwasp.h  # public API: ctx, nodes, regions, locks, events
+│   ├── src/                # framing + request loop, memory host engine, discovery
+│   ├── test/mock_test.c    # scripted fake-node test (`make check`, no hardware)
+│   └── Makefile            # POSIX build: libwasp.so
 ├── tools/
-│   ├── wasp_client.py      # test client + remote-memory host (embryonic coordinator)
+│   ├── wasp_client.py      # pure-Python reference client + remote-memory host
+│   ├── libwasp.py          # ctypes binding: wasp_client-compatible WaspNode over libwasp
+│   ├── libwasp_selftest.py # runs wasp_client's test suites through the C library
 │   ├── swarm_test.py       # multi-node concurrency test (distributed sum, race,
 │   │                       #   fail-fast vs queued locks vs atomic MEM_ADD)
 │   ├── include/wasp/remote.h   # module-side remote memory API (C)
@@ -614,5 +623,17 @@ Phase 4 — research:
       the node→coordinator RPC slot generalized to a small table keyed
       by instance. Today's fleet stays single-instance: the Pico W is
       at ~93% RAM and the F439's pool fits exactly one 64 KiB page.
-- [ ] Coordinator (separate effort)
+      A purpose-built node board for this (STM32H723 + octal PSRAM +
+      Eth/WiFi) is sketched in [docs/hardware.md](docs/hardware.md).
+- [ ] Coordinator — `libwasp` C core with a Python binding on top,
+      also embeddable in firmware so nodes can delegate pooled worker
+      functions to idle peers with or without a dedicated coordinator
+      (design sketch: [docs/coordinator.md](docs/coordinator.md)).
+      Step 1 landed 2026-07: `libwasp/` implements the full
+      coordinator role in C (framing, blocking RPC with inline
+      remote-memory serving, region/lock/atomics engine, queued
+      locks, discovery, write-observation events) with a
+      wasp_client-compatible ctypes binding — the complete
+      wasp_client self-test suite and the Mandelbrot demo (incl.
+      `--chaos` recovery) pass through it on the 6-node fleet.
 - [ ] More boards

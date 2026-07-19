@@ -8,6 +8,8 @@ in Q4.28 fixed point, and ships every finished tile with one bulk
 MEM_WRITE. No scheduler: fast nodes claim more tiles, and the live
 view + provenance image show exactly who rendered what. If a node dies
 mid-render, its lost tiles are detected and re-issued to the survivors.
+The coordinator side runs on libwasp (the C coordinator library, via
+tools/libwasp.py); framebuffer writes are observed as libwasp events.
 
 Usage:
   mandelbrot_demo.py discover [options]
@@ -39,7 +41,7 @@ import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from wasp_client import WaspNode, discover, pack_ref, MEM_WRITE
+from libwasp import WaspNode, discover, pack_ref, default_ctx, EV_MEM_WRITE
 
 PARAMS_REGION, CTR_REGION, FB_REGION = 1, 2, 3
 Q = 1 << 28  # Q4.28
@@ -48,23 +50,6 @@ NODE_COLORS = [
     (231, 76, 60), (52, 152, 219), (46, 204, 113), (241, 196, 15),
     (155, 89, 182), (26, 188, 156), (230, 126, 34), (149, 165, 166),
 ]
-
-
-class DemoNode(WaspNode):
-    """WaspNode that reports framebuffer writes back to the demo, so
-    tile completion and provenance are tracked with zero module help."""
-
-    def __init__(self, *args, demo=None, index=0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.demo = demo
-        self.index = index
-
-    def _node_response(self, rtype, p):
-        if rtype == MEM_WRITE and self.demo is not None and len(p) >= 4:
-            ref = struct.unpack_from("<I", p)[0]
-            if ref >> 24 == FB_REGION:
-                self.demo.record_write(self.index, ref & 0xFFFFFF)
-        return super()._node_response(rtype, p)
 
 
 class Demo:
@@ -93,7 +78,7 @@ class Demo:
                         CTR_REGION: bytearray(8),
                         FB_REGION: self.fb}
 
-    # Called with WaspNode._mem_cond held — no extra locking needed.
+    # Called from the event pump / drain only (single writer).
     def record_write(self, node_index, offset):
         tile = offset // (self.tile_rows * self.w)
         if 0 <= tile < self.tiles:
@@ -332,14 +317,38 @@ def main():
 
     demo = Demo(args, ips, boards)
     wasm = open(args.module, "rb").read()
-    locks, lock_queue = {}, {}
+    ctx = default_ctx()
+    for rid, buf in demo.regions.items():
+        ctx.register_region(rid, buf)
+
+    # Framebuffer MEM_WRITEs surface as libwasp events; turning them
+    # into completion + provenance records replaces the _node_response
+    # override the pure-Python client needed.
+    stop_pump = threading.Event()
+
+    def on_event(ev):
+        if ev.type == EV_MEM_WRITE and ev.region == FB_REGION:
+            demo.record_write(ev.tag, ev.offset)
+
+    def pump():
+        while not stop_pump.is_set():
+            ev = ctx.poll_event(0.2)
+            if ev:
+                on_event(ev)
+
+    def drain():
+        """Consume already-queued events (all writes are acked before a
+        call returns, so post-join the queue is complete)."""
+        while (ev := ctx.poll_event(0.05)) is not None:
+            on_event(ev)
+
+    pump_thread = threading.Thread(target=pump)
+    pump_thread.start()
+
     nodes = []
     for i, ip in enumerate(ips):
-        node = DemoNode(ip, 4242, timeout=120.0, lock_owner=ip,
-                        demo=demo, index=i)
-        node.regions = demo.regions
-        node.locks = locks
-        node.lock_queue = lock_queue
+        node = WaspNode(ip, 4242, timeout=120.0, lock_owner=ip, tag=i)
+        node.index = i
         node.hello()
         try:
             node.load(wasm)
@@ -383,6 +392,7 @@ def main():
     (plain_view if args.no_live else live_view)(demo, workers, rec)
     for t in workers:
         t.join()
+    drain()
 
     # Re-issue tiles lost with dead nodes (claimed but never written).
     missing = [t for t, o in enumerate(demo.tile_owner) if o is None]
@@ -400,6 +410,10 @@ def main():
                 raise SystemExit(f"re-issue of tile {tile} failed: {r}")
             if rec:
                 rec.snap(demo.fb)
+
+    drain()
+    stop_pump.set()
+    pump_thread.join()
 
     dt = time.monotonic() - demo.t0
     for node in alive:

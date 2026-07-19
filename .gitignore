@@ -16,5 +16,10 @@
 /tools/*.wasm
 /tools/wasp-remote-pass/*.so
 
+# libwasp build output
+/libwasp/*.so
+/libwasp/src/*.o
+/libwasp/test/mock_test
+
 __pycache__/
 *.pyc
