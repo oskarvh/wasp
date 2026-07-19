@@ -1,16 +1,21 @@
 # Coordinator design sketch: libwasp + peer load sharing
 
-Design sketch (2026-07-18) for the coordinator effort. Two goals:
+Design sketch (2026-07-18) for the coordinator effort. Three goals:
 
 1. **One C library (`libwasp`)** implementing the coordinator role,
    used three ways: linked into a native C coordinator, wrapped as a
    Python extension (today's `wasp_client.py` tooling becomes a thin
    layer over it), and — the payoff — compiled into node firmware so
    MCUs can play the coordinator role toward each other.
-2. **1–N nodes, 0–1 coordinators.** A dedicated coordinator is
+2. **1–N nodes, 0–M coordinators.** A dedicated coordinator is
    optional. Nodes carry a pool of pre-built worker modules in flash
    and hand work to idle peers, best-effort: if no peer is free, run
    it yourself.
+3. **Orchestration logic itself runs in WAMR.** Transport, framing,
+   and the region engine stay in firmware; the coordinator *brain* —
+   what to delegate, to whom, when to re-issue — is a wasm module
+   using peer host functions (see
+   [the coordinator brain as a module](#the-coordinator-brain-as-a-module)).
 
 ## The unifying idea: roles, not boxes
 
@@ -145,6 +150,41 @@ machinery (`LOAD_POOLED` + ANNOUNCE status + on-node client role) and
 proves the architecture. The Mandelbrot counter pattern is a degenerate
 task board already.
 
+## The coordinator brain as a module
+
+The coordinator role decomposes: transport, framing, discovery, and
+the region engine are mechanism (firmware, from the libwasp port);
+*policy* — which module, how to split work, who gets what, when to
+re-issue — is a brain that can run inside WAMR like any other module.
+
+- **Peer host functions** are the boundary, a small i32-handle-only
+  family: `wasp_peer_discover`, `wasp_peer_connect`,
+  `wasp_peer_load`, `wasp_peer_call_async`, `wasp_peer_poll`, plus
+  `wasp_export_region(id, ptr, len)`. After an export, firmware
+  serves worker MEM/LOCK/atomic RPCs straight out of the exported
+  buffer — bounds-checked native code that never re-enters wasm.
+  Exports can be backed by the module's linear memory (small jobs) or
+  by host RAM the firmware lends out (big framebuffers, CCM).
+- **Single-threaded wasm is enough**: coordinator work per event is
+  microseconds (grant a tile, accept a write); the seconds belong to
+  the workers. The brain is an event loop over async call handles.
+- **Why bother**: the brain becomes a ~2 KiB module — pushed,
+  hot-swapped, and re-targeted over the network like any other wasm.
+  Scheduling policy stops being firmware.
+- **Discipline that makes it cheap**: the firmware-driven conductor
+  (build-order step 3) writes its brain in C *against exactly this
+  API shape* — i32 handles, no firmware internals. Step 4 then just
+  registers the same functions as WAMR natives and the brain
+  recompiles as a module.
+- Not doing: compiling libwasp itself to wasm32 with raw-socket host
+  functions. Feasible (the core is allocation-free ILP32-clean C) but
+  it inverts the trust model for no gain over the split above.
+
+RAM reality on today's fleet: the brain needs one WAMR instance
+(≥64 KiB linear memory) — the Nucleo's pool holds exactly one, so a
+brain node doesn't also render until RAM-rich hardware
+([hardware.md](hardware.md)) lands. Workers are untouched either way.
+
 ## 0–M job owners
 
 Nothing limits the system to one coordinator: "job owner" is a role,
@@ -214,13 +254,40 @@ Yes, with three honest caveats:
    GIF recording included). `wasp_client.py` stays as the
    pure-Python reference; `swarm_test.py`/`perf_test.py` still use
    it and can port later.
-2. **Client role in firmware**: node dials a peer, `LOAD`s, `CALL`s —
-   demo: Nucleo drives one Pico with no Linux box involved.
-3. **Region host in firmware** (link `libwasp host/` into the app):
-   owner-hosted regions; demo: coordinator-less Mandelbrot — Nucleo
-   owns params/counter/framebuffer in its RAM, farms tiles to Picos.
-4. **Pool + ANNOUNCE v2 + spawn/join** host functions; chaos test:
-   kill a peer mid-task, watch the local fallback complete the job.
+2. **Zephyr port of the libwasp core** — **done 2026-07-18.**
+   libwasp now sits behind a port layer (`src/port.h`;
+   `port_posix.c` / `port_zephyr.c` — k_mutex/k_condvar + zsock) and
+   the core is OS-free and allocation-free (`wasp_ctx_init` /
+   `wasp_node_connect_static` take caller buffers; tables shrink via
+   `WASP_MAX_REGIONS`/`WASP_EVQ_CAP` compile defs). `CONFIG_WASP_PEER`
+   compiles it into the app (+~7 KiB RAM on the Nucleo: 2 KiB rx,
+   tables, thread stack); worker-only builds pay nothing.
+   Verified on hardware: `CONFIG_WASP_PEER_SMOKE`
+   (`west build -b nucleo_f439zi app -d build/peer --
+   -DEXTRA_CONF_FILE=peer_smoke.conf`) boots the Nucleo, dials a
+   stock-firmware Pico, pushes `remote_module.wasm` from its own
+   flash, and serves the module's REGION_INFO / bulk MEM_READ /
+   MEM_WRITE / MEM_ADD / LOCK+UNLOCK RPCs from Nucleo RAM —
+   `PEER SMOKE: PASS` on the ST-Link console, worker role regression-
+   free (full selftest suite still passes against the same build).
+   The async RPC-slot table moved to step 3, where the multi-worker
+   driver actually needs it.
+3. **Firmware-driven conductor demo**: conductor-only Nucleo build
+   (no WAMR → RAM headroom for a full 256×192 framebuffer). It
+   listens for worker ANNOUNCEs, connects to the Picos, pushes the
+   mandelbrot module *from its own flash* (one embedded module — the
+   embryo of the worker pool), hosts params/counter/framebuffer,
+   re-issues lost tiles. Display: serial console progress + final
+   framebuffer dump, PNG'd by a tiny script. Workers: zero changes.
+   The conductor brain is written in C **against the peer
+   host-function API shape** so step 4 can lift it into wasm.
+4. **Coordinator brain in WAMR**: register the peer functions as WAMR
+   natives; the brain becomes a ~2 KiB module, pushed and hot-swapped
+   over the network — same render, swappable scheduling policy.
+5. **Worker pool + peer etiquette**: `LOAD_POOLED` + the ANNOUNCE v2
+   status byte, `spawn`/`join` sugar on the peer API, and the 0–M
+   hardening (BUSY-as-EAGAIN, randomized pick, depth cap). Chaos
+   test: kill a peer mid-task, watch the local fallback finish.
 
-Step 1 is worth doing even if peer sharing never ships; steps 2–4
+Step 1 was worth doing even if peer sharing never ships; steps 2–5
 each demo independently on today's fleet.

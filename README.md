@@ -188,7 +188,7 @@ wasp/
 │   └── diagrams/           # PlantUML sequence diagrams for every protocol scenario
 ├── libwasp/                # the coordinator as a C library (docs/coordinator.md)
 │   ├── include/wasp/libwasp.h  # public API: ctx, nodes, regions, locks, events
-│   ├── src/                # framing + request loop, memory host engine, discovery
+│   ├── src/                # OS-free core + memory host; port_posix.c / port_zephyr.c
 │   ├── test/mock_test.c    # scripted fake-node test (`make check`, no hardware)
 │   └── Makefile            # POSIX build: libwasp.so
 ├── tools/
@@ -636,4 +636,10 @@ Phase 4 — research:
       wasp_client-compatible ctypes binding — the complete
       wasp_client self-test suite and the Mandelbrot demo (incl.
       `--chaos` recovery) pass through it on the 6-node fleet.
+      Step 2 landed 2026-07: libwasp compiles into the firmware
+      itself (`CONFIG_WASP_PEER`, port layer + static allocation) —
+      a Nucleo booted, dialed a stock Pico, pushed a module from its
+      own flash, and served that module's remote-memory RPCs from
+      its own RAM (`CONFIG_WASP_PEER_SMOKE`). Nodes can now be
+      coordinators. Next: the firmware-driven conductor demo.
 - [ ] More boards

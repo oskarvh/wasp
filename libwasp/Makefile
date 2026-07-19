@@ -6,7 +6,7 @@ CFLAGS += -Wall -Wextra -std=c11 -fPIC -pthread \
 	-Iinclude -I../app/src -D_GNU_SOURCE
 LDFLAGS += -pthread
 
-SRCS := src/core.c src/host.c src/discover.c
+SRCS := src/core.c src/host.c src/discover.c src/port_posix.c
 OBJS := $(SRCS:.c=.o)
 
 all: libwasp.so test/mock_test
@@ -14,7 +14,7 @@ all: libwasp.so test/mock_test
 libwasp.so: $(OBJS)
 	$(CC) -shared $(LDFLAGS) -o $@ $(OBJS)
 
-$(OBJS): include/wasp/libwasp.h src/internal.h
+$(OBJS): include/wasp/libwasp.h src/internal.h src/port.h
 
 test/mock_test: test/mock_test.c libwasp.so
 	$(CC) $(CFLAGS) -o $@ $< -L. -lwasp -Wl,-rpath,'$$ORIGIN/..'

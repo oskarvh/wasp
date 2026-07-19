@@ -1,30 +1,14 @@
 /*
  * libwasp core: connection lifecycle, frame I/O, the blocking request
  * loop (which services node-initiated remote-memory RPCs inline), and
- * the typed wrappers on top of it.
+ * the typed wrappers on top of it. OS-free: everything below reaches
+ * the system only through port.h, so this file compiles unchanged
+ * into a Linux coordinator and into Zephyr node firmware.
  */
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <time.h>
-#include <unistd.h>
 
 #include "internal.h"
-
-uint64_t wasp_now_ms(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
-}
 
 const char *wasp_strerror(int err)
 {
@@ -71,48 +55,6 @@ const char *wasp_strerror(int err)
 
 /* ---- frame I/O ----------------------------------------------------- */
 
-static int send_all(int fd, const void *buf, size_t len)
-{
-	const uint8_t *p = buf;
-
-	while (len > 0) {
-		ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
-
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				return WASP_E_TIMEOUT;
-			return WASP_E_CONN;
-		}
-		p += n;
-		len -= (size_t)n;
-	}
-	return WASP_OK;
-}
-
-static int recv_exact(int fd, void *buf, size_t len)
-{
-	uint8_t *p = buf;
-
-	while (len > 0) {
-		ssize_t n = recv(fd, p, len, 0);
-
-		if (n == 0)
-			return WASP_E_CONN;
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				return WASP_E_TIMEOUT;
-			return WASP_E_CONN;
-		}
-		p += n;
-		len -= (size_t)n;
-	}
-	return WASP_OK;
-}
-
 int wasp_send_frame(int fd, uint8_t type, uint8_t seq, const void *payload,
 		    uint32_t len)
 {
@@ -123,18 +65,19 @@ int wasp_send_frame(int fd, uint8_t type, uint8_t seq, const void *payload,
 	};
 	int rc;
 
-	/* Small frames go out in one segment (TCP_NODELAY is set);
-	 * large payloads follow separately to avoid a copy. */
-	if (len > 0 && len <= 512) {
-		uint8_t pkt[WASP_FRAME_HDR_SIZE + 512];
+	/* Control-sized frames go out in one segment; large payloads
+	 * follow separately to avoid the copy (TCP_NODELAY is set on
+	 * both ends, so two segments cost no Nagle stall). */
+	if (len > 0 && len <= 128) {
+		uint8_t pkt[WASP_FRAME_HDR_SIZE + 128];
 
 		memcpy(pkt, hdr, sizeof(hdr));
 		memcpy(pkt + sizeof(hdr), payload, len);
-		return send_all(fd, pkt, sizeof(hdr) + len);
+		return wasp_net_send(fd, pkt, sizeof(hdr) + len);
 	}
-	rc = send_all(fd, hdr, sizeof(hdr));
+	rc = wasp_net_send(fd, hdr, sizeof(hdr));
 	if (rc == WASP_OK && len > 0)
-		rc = send_all(fd, payload, len);
+		rc = wasp_net_send(fd, payload, len);
 	return rc;
 }
 
@@ -144,7 +87,7 @@ static int recv_frame(wasp_node *n, uint8_t *type, uint8_t *seq,
 {
 	uint8_t hdr[WASP_FRAME_HDR_SIZE];
 	uint32_t plen;
-	int rc = recv_exact(n->fd, hdr, sizeof(hdr));
+	int rc = wasp_net_recv_exact(n->fd, hdr, sizeof(hdr));
 
 	if (rc != WASP_OK)
 		return rc;
@@ -152,9 +95,9 @@ static int recv_frame(wasp_node *n, uint8_t *type, uint8_t *seq,
 		return WASP_E_STREAM;
 	plen = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) |
 	       ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
-	if (plen > WASP_RX_CAP)
+	if (plen > n->rx_cap)
 		return WASP_E_STREAM; /* can't resync mid-payload */
-	rc = recv_exact(n->fd, n->rx, plen);
+	rc = wasp_net_recv_exact(n->fd, n->rx, plen);
 	if (rc != WASP_OK)
 		return rc;
 	*type = hdr[WASP_FRAME_OFF_TYPE];
@@ -165,91 +108,65 @@ static int recv_frame(wasp_node *n, uint8_t *type, uint8_t *seq,
 
 /* ---- connection lifecycle ------------------------------------------ */
 
-static int connect_timeout(int fd, const struct sockaddr *sa, socklen_t salen,
-			   uint32_t timeout_ms)
+void wasp_node_attach(wasp_node *n, wasp_ctx *ctx, int fd, uint8_t *rx,
+		      uint32_t rx_cap, uint32_t timeout_ms)
 {
-	struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-	int err = 0;
-	socklen_t elen = sizeof(err);
-	int flags = fcntl(fd, F_GETFL, 0);
+	memset(n, 0, sizeof(*n));
+	n->ctx = ctx;
+	n->fd = fd;
+	n->rx = rx;
+	n->rx_cap = rx_cap;
+	n->timeout_ms = timeout_ms;
+	strncpy(n->owner, "node", sizeof(n->owner) - 1);
+	/* Random-ish start so a stale response from a previous
+	 * connection can't accidentally match our first request. */
+	n->seq = (uint8_t)(wasp_now_ms() ^ (uintptr_t)n ^ (unsigned)fd);
+}
 
-	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-	if (connect(fd, sa, salen) == 0)
-		goto done;
-	if (errno != EINPROGRESS)
+int wasp_node_connect_static(wasp_node *n, wasp_ctx *ctx, uint8_t *rx,
+			     uint32_t rx_cap, const char *host, uint16_t port,
+			     uint32_t timeout_ms)
+{
+	int fd;
+
+	if (!n || !ctx || !rx || rx_cap < 64 || !host || timeout_ms == 0)
+		return WASP_E_ARG;
+	fd = wasp_net_connect(host, port, timeout_ms);
+	if (fd < 0)
 		return WASP_E_CONN;
-	if (poll(&pfd, 1, (int)timeout_ms) <= 0)
-		return WASP_E_TIMEOUT;
-	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err != 0)
-		return WASP_E_CONN;
-done:
-	fcntl(fd, F_SETFL, flags);
+	wasp_node_attach(n, ctx, fd, rx, rx_cap, timeout_ms);
 	return WASP_OK;
 }
 
 wasp_node *wasp_connect(wasp_ctx *ctx, const char *host, uint16_t port,
 			uint32_t timeout_ms)
 {
-	struct addrinfo hints = { .ai_family = AF_UNSPEC,
-				  .ai_socktype = SOCK_STREAM };
-	struct addrinfo *res = NULL, *ai;
-	char portstr[8];
 	wasp_node *n;
-	int fd = -1;
+	uint8_t *rx;
 
 	if (!ctx || !host || timeout_ms == 0)
 		return NULL;
-	snprintf(portstr, sizeof(portstr), "%u", port);
-	if (getaddrinfo(host, portstr, &hints, &res) != 0)
-		return NULL;
-	for (ai = res; ai; ai = ai->ai_next) {
-		fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-		if (fd < 0)
-			continue;
-		if (connect_timeout(fd, ai->ai_addr, ai->ai_addrlen,
-				    timeout_ms) == WASP_OK)
-			break;
-		close(fd);
-		fd = -1;
-	}
-	freeaddrinfo(res);
-	if (fd < 0)
-		return NULL;
-
-	n = calloc(1, sizeof(*n));
-	if (!n) {
-		close(fd);
-		return NULL;
-	}
-	n->rx = malloc(WASP_RX_CAP);
-	if (!n->rx) {
-		close(fd);
+	n = malloc(sizeof(*n));
+	rx = malloc(WASP_RX_CAP_DEFAULT);
+	if (!n || !rx) {
 		free(n);
+		free(rx);
 		return NULL;
 	}
-	n->ctx = ctx;
-	n->fd = fd;
-	n->timeout_ms = timeout_ms;
-	strncpy(n->owner, "node", sizeof(n->owner) - 1);
-
-	/* Latency-sensitive small-frame RPC: never wait on Nagle. */
-	int one = 1;
-	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-	struct timeval tv = { .tv_sec = timeout_ms / 1000,
-			      .tv_usec = (timeout_ms % 1000) * 1000 };
-	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-	/* Random start so a stale response from a previous connection
-	 * can't accidentally match our first request's seq. */
-	n->seq = (uint8_t)(wasp_now_ms() ^ (uintptr_t)n ^ (unsigned)fd);
+	if (wasp_node_connect_static(n, ctx, rx, WASP_RX_CAP_DEFAULT, host,
+				     port, timeout_ms) != WASP_OK) {
+		free(n);
+		free(rx);
+		return NULL;
+	}
+	n->heap = 1;
 	return n;
 }
 
 void wasp_node_kill(wasp_node *n)
 {
 	if (n && n->fd >= 0)
-		shutdown(n->fd, SHUT_RDWR);
+		wasp_net_shutdown(n->fd);
 }
 
 void wasp_node_free(wasp_node *n)
@@ -257,9 +174,12 @@ void wasp_node_free(wasp_node *n)
 	if (!n)
 		return;
 	if (n->fd >= 0)
-		close(n->fd);
-	free(n->rx);
-	free(n);
+		wasp_net_close(n->fd);
+	n->fd = -1;
+	if (n->heap) {
+		free(n->rx);
+		free(n);
+	}
 }
 
 void wasp_node_set_owner(wasp_node *n, const char *owner)

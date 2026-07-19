@@ -4,9 +4,8 @@
  * ctx's registered regions, under one mutex shared by every
  * connection — that serialization is the atomicity guarantee for
  * MEM_ADD/MEM_CAS and the exactness guarantee for locks. Behavior
- * mirrors tools/wasp_client.py.
+ * mirrors tools/wasp_client.py. OS access only via port.h.
  */
-#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,26 +13,22 @@
 
 /* ---- ctx lifecycle ------------------------------------------------- */
 
-static void cond_init_monotonic(pthread_cond_t *cv)
+void wasp_ctx_init(wasp_ctx *ctx)
 {
-	pthread_condattr_t attr;
-
-	pthread_condattr_init(&attr);
-	pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-	pthread_cond_init(cv, &attr);
-	pthread_condattr_destroy(&attr);
+	memset(ctx, 0, sizeof(*ctx));
+	wasp_mutex_init(&ctx->mem_mu);
+	wasp_mutex_init(&ctx->ev_mu);
+	wasp_cond_init(&ctx->mem_cv);
+	wasp_cond_init(&ctx->ev_cv);
 }
 
 wasp_ctx *wasp_ctx_new(void)
 {
-	wasp_ctx *ctx = calloc(1, sizeof(*ctx));
+	wasp_ctx *ctx = malloc(sizeof(*ctx));
 
 	if (!ctx)
 		return NULL;
-	pthread_mutex_init(&ctx->mem_mu, NULL);
-	pthread_mutex_init(&ctx->ev_mu, NULL);
-	cond_init_monotonic(&ctx->mem_cv);
-	cond_init_monotonic(&ctx->ev_cv);
+	wasp_ctx_init(ctx);
 	return ctx;
 }
 
@@ -41,10 +36,10 @@ void wasp_ctx_free(wasp_ctx *ctx)
 {
 	if (!ctx)
 		return;
-	pthread_mutex_destroy(&ctx->mem_mu);
-	pthread_mutex_destroy(&ctx->ev_mu);
-	pthread_cond_destroy(&ctx->mem_cv);
-	pthread_cond_destroy(&ctx->ev_cv);
+	wasp_mutex_destroy(&ctx->mem_mu);
+	wasp_mutex_destroy(&ctx->ev_mu);
+	wasp_cond_destroy(&ctx->mem_cv);
+	wasp_cond_destroy(&ctx->ev_cv);
 	free(ctx);
 }
 
@@ -53,31 +48,41 @@ void wasp_ctx_free(wasp_ctx *ctx)
 int wasp_region_register(wasp_ctx *ctx, uint8_t region_id, void *buf,
 			 uint32_t len)
 {
-	if (!ctx || !buf || len == 0 || len > WASP_REF_MAX_OFFSET)
+	if (!ctx || !buf || len == 0 || len > WASP_REF_MAX_OFFSET ||
+	    (uint32_t)region_id >= WASP_MAX_REGIONS)
 		return WASP_E_ARG;
-	pthread_mutex_lock(&ctx->mem_mu);
+	wasp_mutex_lock(&ctx->mem_mu);
 	ctx->regions[region_id].buf = buf;
 	ctx->regions[region_id].len = len;
-	pthread_mutex_unlock(&ctx->mem_mu);
+	wasp_mutex_unlock(&ctx->mem_mu);
 	return WASP_OK;
 }
 
 int wasp_region_unregister(wasp_ctx *ctx, uint8_t region_id)
 {
-	if (!ctx)
+	if (!ctx || (uint32_t)region_id >= WASP_MAX_REGIONS)
 		return WASP_E_ARG;
-	pthread_mutex_lock(&ctx->mem_mu);
+	wasp_mutex_lock(&ctx->mem_mu);
 	ctx->regions[region_id].buf = NULL;
 	ctx->regions[region_id].len = 0;
-	pthread_mutex_unlock(&ctx->mem_mu);
+	wasp_mutex_unlock(&ctx->mem_mu);
 	return WASP_OK;
+}
+
+/* Registered region, or NULL (also for out-of-table ids). Call with
+ * mem_mu held. */
+static struct wasp_region *region_get(wasp_ctx *ctx, uint32_t region)
+{
+	if (region >= WASP_MAX_REGIONS || !ctx->regions[region].buf)
+		return NULL;
+	return &ctx->regions[region];
 }
 
 /* ---- locks --------------------------------------------------------- */
 
 /* Current unexpired lease holder, or NULL. Expired -> revoked.
- * Call with mem_mu held. */
-static const char *lock_holder(wasp_ctx *ctx, uint8_t region)
+ * Call with mem_mu held; region must be < WASP_MAX_REGIONS. */
+static const char *lock_holder(wasp_ctx *ctx, uint32_t region)
 {
 	struct wasp_lock *lk = &ctx->locks[region];
 
@@ -91,14 +96,14 @@ static const char *lock_holder(wasp_ctx *ctx, uint8_t region)
 }
 
 /* Held by nobody, or by `owner` itself. Call with mem_mu held. */
-static int lock_permits(wasp_ctx *ctx, uint8_t region, const char *owner)
+static int lock_permits(wasp_ctx *ctx, uint32_t region, const char *owner)
 {
 	const char *h = lock_holder(ctx, region);
 
 	return h == NULL || strcmp(h, owner) == 0;
 }
 
-static void lock_set(wasp_ctx *ctx, uint8_t region, const char *owner,
+static void lock_set(wasp_ctx *ctx, uint32_t region, const char *owner,
 		     uint32_t lease_ms)
 {
 	struct wasp_lock *lk = &ctx->locks[region];
@@ -112,22 +117,22 @@ static void lock_set(wasp_ctx *ctx, uint8_t region, const char *owner,
 int wasp_lock_force(wasp_ctx *ctx, uint8_t region_id, const char *owner,
 		    uint32_t lease_ms)
 {
-	if (!ctx || !owner)
+	if (!ctx || !owner || (uint32_t)region_id >= WASP_MAX_REGIONS)
 		return WASP_E_ARG;
-	pthread_mutex_lock(&ctx->mem_mu);
+	wasp_mutex_lock(&ctx->mem_mu);
 	lock_set(ctx, region_id, owner, lease_ms);
-	pthread_mutex_unlock(&ctx->mem_mu);
+	wasp_mutex_unlock(&ctx->mem_mu);
 	return WASP_OK;
 }
 
 int wasp_lock_clear(wasp_ctx *ctx, uint8_t region_id)
 {
-	if (!ctx)
+	if (!ctx || (uint32_t)region_id >= WASP_MAX_REGIONS)
 		return WASP_E_ARG;
-	pthread_mutex_lock(&ctx->mem_mu);
+	wasp_mutex_lock(&ctx->mem_mu);
 	ctx->locks[region_id].held = 0;
-	pthread_cond_broadcast(&ctx->mem_cv);
-	pthread_mutex_unlock(&ctx->mem_mu);
+	wasp_cond_broadcast(&ctx->mem_cv);
+	wasp_mutex_unlock(&ctx->mem_mu);
 	return WASP_OK;
 }
 
@@ -137,16 +142,16 @@ int wasp_lock_holder(wasp_ctx *ctx, uint8_t region_id, char *out,
 	const char *h;
 	int held;
 
-	if (!ctx)
+	if (!ctx || (uint32_t)region_id >= WASP_MAX_REGIONS)
 		return WASP_E_ARG;
-	pthread_mutex_lock(&ctx->mem_mu);
+	wasp_mutex_lock(&ctx->mem_mu);
 	h = lock_holder(ctx, region_id);
 	held = h != NULL;
 	if (h && out && cap > 0) {
 		strncpy(out, h, cap - 1);
 		out[cap - 1] = '\0';
 	}
-	pthread_mutex_unlock(&ctx->mem_mu);
+	wasp_mutex_unlock(&ctx->mem_mu);
 	return held;
 }
 
@@ -154,35 +159,34 @@ int wasp_lock_holder(wasp_ctx *ctx, uint8_t region_id, char *out,
 
 static void ev_push(wasp_ctx *ctx, const wasp_event *ev)
 {
-	pthread_mutex_lock(&ctx->ev_mu);
+	wasp_mutex_lock(&ctx->ev_mu);
 	if (ctx->ev_count == WASP_EVQ_CAP) {
 		ctx->ev_dropped++;
 	} else {
 		ctx->evq[(ctx->ev_head + ctx->ev_count) % WASP_EVQ_CAP] = *ev;
 		ctx->ev_count++;
-		pthread_cond_signal(&ctx->ev_cv);
+		wasp_cond_signal(&ctx->ev_cv);
 	}
-	pthread_mutex_unlock(&ctx->ev_mu);
+	wasp_mutex_unlock(&ctx->ev_mu);
 }
 
 int wasp_poll_event(wasp_ctx *ctx, wasp_event *out, uint32_t timeout_ms)
 {
-	uint64_t deadline_ms;
-	struct timespec ts;
+	uint64_t deadline;
 	int got = 0;
 
 	if (!ctx || !out)
 		return WASP_E_ARG;
-	deadline_ms = wasp_now_ms() + timeout_ms;
-	ts.tv_sec = (time_t)(deadline_ms / 1000);
-	ts.tv_nsec = (long)(deadline_ms % 1000) * 1000000;
+	deadline = wasp_now_ms() + timeout_ms;
 
-	pthread_mutex_lock(&ctx->ev_mu);
+	wasp_mutex_lock(&ctx->ev_mu);
 	while (ctx->ev_count == 0) {
-		if (timeout_ms == 0 ||
-		    pthread_cond_timedwait(&ctx->ev_cv, &ctx->ev_mu, &ts) ==
-			    ETIMEDOUT)
+		uint64_t now = wasp_now_ms();
+
+		if (now >= deadline)
 			break;
+		wasp_cond_timedwait_ms(&ctx->ev_cv, &ctx->ev_mu,
+				       (uint32_t)(deadline - now));
 	}
 	if (ctx->ev_count > 0) {
 		*out = ctx->evq[ctx->ev_head];
@@ -190,7 +194,7 @@ int wasp_poll_event(wasp_ctx *ctx, wasp_event *out, uint32_t timeout_ms)
 		ctx->ev_count--;
 		got = 1;
 	}
-	pthread_mutex_unlock(&ctx->ev_mu);
+	wasp_mutex_unlock(&ctx->ev_mu);
 	return got;
 }
 
@@ -252,7 +256,7 @@ static void put_u32(uint8_t *p, uint32_t v)
 }
 
 /* Grant the lock to n and build the LOCK_GRANT response. */
-static void lock_grant(wasp_node *n, uint8_t region, struct resp *r)
+static void lock_grant(wasp_node *n, uint32_t region, struct resp *r)
 {
 	lock_set(n->ctx, region, n->owner, WASP_LOCK_LEASE_MS);
 	resp_u32(r, WASP_MSG_LOCK_GRANT, WASP_LOCK_LEASE_MS);
@@ -263,7 +267,7 @@ static void lock_grant(wasp_node *n, uint8_t region, struct resp *r)
  * region. Runs with mem_mu held; the cond wait releases it so the
  * holder's own UNLOCK can be serviced by its thread meanwhile.
  */
-static void lock_response(wasp_node *n, uint8_t region, struct resp *r)
+static void lock_response(wasp_node *n, uint32_t region, struct resp *r)
 {
 	wasp_ctx *ctx = n->ctx;
 	struct wasp_waiter w = { .owner = n->owner };
@@ -287,25 +291,19 @@ static void lock_response(wasp_node *n, uint8_t region, struct resp *r)
 	deadline = wasp_now_ms() + WASP_LOCK_QUEUE_WAIT_MS;
 
 	for (;;) {
-		uint64_t now = wasp_now_ms();
-		struct timespec ts;
-
 		if (strcmp(ctx->qhead[region]->owner, n->owner) == 0 &&
 		    lock_permits(ctx, region, n->owner)) {
 			lock_grant(n, region, r);
 			break;
 		}
-		if (now >= deadline) {
+		if (wasp_now_ms() >= deadline) {
 			/* Queue too deep for the node's RPC timeout:
 			 * fail fast after all, don't trap the module. */
 			resp_error(r, WASP_ERR_LOCKED, NULL);
 			break;
 		}
 		/* Short timeout so lazy lease expiry is noticed too. */
-		now += 50;
-		ts.tv_sec = (time_t)(now / 1000);
-		ts.tv_nsec = (long)(now % 1000) * 1000000;
-		pthread_cond_timedwait(&ctx->mem_cv, &ctx->mem_mu, &ts);
+		wasp_cond_timedwait_ms(&ctx->mem_cv, &ctx->mem_mu, 50);
 	}
 
 	for (pp = &ctx->qhead[region]; *pp; pp = &(*pp)->next) {
@@ -338,8 +336,8 @@ static void node_response(wasp_node *n, uint8_t rtype, uint8_t *p,
 			return;
 		}
 		region = p[0];
-		reg = &ctx->regions[region];
-		if (!reg->buf) {
+		reg = region_get(ctx, region);
+		if (!reg) {
 			resp_error(r, WASP_ERR_NO_REGION, NULL);
 			return;
 		}
@@ -348,18 +346,18 @@ static void node_response(wasp_node *n, uint8_t rtype, uint8_t *p,
 			return;
 		}
 		if (rtype == WASP_MSG_LOCK) {
-			lock_response(n, (uint8_t)region, r);
+			lock_response(n, region, r);
 			return;
 		}
 		/* UNLOCK */
-		const char *h = lock_holder(ctx, (uint8_t)region);
+		const char *h = lock_holder(ctx, region);
 
 		if (!h || strcmp(h, n->owner) != 0) {
 			resp_error(r, WASP_ERR_BAD_ARGS, "not lock holder");
 			return;
 		}
 		ctx->locks[region].held = 0;
-		pthread_cond_broadcast(&ctx->mem_cv); /* wake queued LOCKs */
+		wasp_cond_broadcast(&ctx->mem_cv); /* wake queued LOCKs */
 		resp_empty(r, WASP_MSG_MEM_ACK);
 		return;
 	}
@@ -379,12 +377,12 @@ static void node_response(wasp_node *n, uint8_t rtype, uint8_t *p,
 		ref = get_u32(p);
 		region = WASP_REF_REGION(ref);
 		offset = WASP_REF_OFFSET(ref);
-		reg = &ctx->regions[region];
-		if (!reg->buf) {
+		reg = region_get(ctx, region);
+		if (!reg) {
 			resp_error(r, WASP_ERR_NO_REGION, NULL);
 			return;
 		}
-		if (!lock_permits(ctx, (uint8_t)region, n->owner)) {
+		if (!lock_permits(ctx, region, n->owner)) {
 			resp_error(r, WASP_ERR_LOCKED, NULL);
 			return;
 		}
@@ -415,12 +413,12 @@ static void node_response(wasp_node *n, uint8_t rtype, uint8_t *p,
 	ref = get_u32(p);
 	region = WASP_REF_REGION(ref);
 	offset = WASP_REF_OFFSET(ref);
-	reg = &ctx->regions[region];
-	if (!reg->buf) {
+	reg = region_get(ctx, region);
+	if (!reg) {
 		resp_error(r, WASP_ERR_NO_REGION, NULL);
 		return;
 	}
-	if (!lock_permits(ctx, (uint8_t)region, n->owner)) {
+	if (!lock_permits(ctx, region, n->owner)) {
 		resp_error(r, WASP_ERR_LOCKED, NULL);
 		return;
 	}
@@ -431,7 +429,7 @@ static void node_response(wasp_node *n, uint8_t rtype, uint8_t *p,
 			resp_error(r, WASP_ERR_BAD_ARGS, "out of bounds");
 			return;
 		}
-		if (rdlen > WASP_RX_CAP) {
+		if (rdlen > n->rx_cap) {
 			resp_error(r, WASP_ERR_TOO_LARGE, NULL);
 			return;
 		}
@@ -463,8 +461,8 @@ int wasp_host_serve(wasp_node *n, uint8_t rtype, uint8_t rseq,
 {
 	struct resp r = { 0 };
 
-	pthread_mutex_lock(&n->ctx->mem_mu);
+	wasp_mutex_lock(&n->ctx->mem_mu);
 	node_response(n, rtype, payload, len, &r);
-	pthread_mutex_unlock(&n->ctx->mem_mu);
+	wasp_mutex_unlock(&n->ctx->mem_mu);
 	return wasp_send_frame(n->fd, r.type, rseq, r.payload, r.len);
 }
