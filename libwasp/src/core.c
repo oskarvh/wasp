@@ -48,6 +48,8 @@ const char *wasp_strerror(int err)
 		return "system error";
 	case WASP_E_UNEXPECTED:
 		return "unexpected response type";
+	case WASP_E_AGAIN:
+		return "async call still running";
 	default:
 		return "unknown error";
 	}
@@ -341,17 +343,14 @@ int wasp_unload(wasp_node *n)
 	return expect_empty_result(n, WASP_MSG_UNLOAD_MODULE, NULL, 0);
 }
 
-int wasp_call(wasp_node *n, const char *fn, const int32_t *argv,
-	      uint32_t argc, int32_t results[WASP_CALL_MAX_RESULTS])
+/* Encode the CALL request payload; returns its length or WASP_E_ARG. */
+static int build_call_req(uint8_t *req, const char *fn, const int32_t *argv,
+			  uint32_t argc)
 {
-	uint8_t req[2 + WASP_CALL_MAX_NAME_LEN + 4 * WASP_CALL_MAX_ARGS];
 	size_t name_len, off;
-	const uint8_t *p;
-	uint8_t t;
-	uint32_t l, i, nres;
-	int rc;
+	uint32_t i;
 
-	if (!n || !fn || (argc > 0 && !argv) || argc > WASP_CALL_MAX_ARGS)
+	if (!fn || (argc > 0 && !argv) || argc > WASP_CALL_MAX_ARGS)
 		return WASP_E_ARG;
 	name_len = strlen(fn);
 	if (name_len == 0 || name_len > WASP_CALL_MAX_NAME_LEN)
@@ -369,11 +368,16 @@ int wasp_call(wasp_node *n, const char *fn, const int32_t *argv,
 		req[off++] = (uint8_t)(v >> 16);
 		req[off++] = (uint8_t)(v >> 24);
 	}
+	return (int)off;
+}
 
-	rc = wasp_request(n, WASP_MSG_CALL, req, (uint32_t)off, &t, NULL, &p,
-			  &l);
-	if (rc != WASP_OK)
-		return rc;
+/* Interpret a CALL response frame with wasp_call's return convention. */
+static int parse_call_result(wasp_node *n, uint8_t t, const uint8_t *p,
+			     uint32_t l,
+			     int32_t results[WASP_CALL_MAX_RESULTS])
+{
+	uint32_t i, nres;
+
 	if (t == WASP_MSG_ERROR)
 		return node_error(n, p, l);
 	if (t != WASP_MSG_RESULT || l < 1)
@@ -390,4 +394,81 @@ int wasp_call(wasp_node *n, const char *fn, const int32_t *argv,
 		results[i] = (int32_t)v;
 	}
 	return (int)nres;
+}
+
+int wasp_call(wasp_node *n, const char *fn, const int32_t *argv,
+	      uint32_t argc, int32_t results[WASP_CALL_MAX_RESULTS])
+{
+	uint8_t req[2 + WASP_CALL_MAX_NAME_LEN + 4 * WASP_CALL_MAX_ARGS];
+	const uint8_t *p;
+	uint8_t t;
+	uint32_t l;
+	int len, rc;
+
+	if (!n)
+		return WASP_E_ARG;
+	len = build_call_req(req, fn, argv, argc);
+	if (len < 0)
+		return len;
+	rc = wasp_request(n, WASP_MSG_CALL, req, (uint32_t)len, &t, NULL, &p,
+			  &l);
+	if (rc != WASP_OK)
+		return rc;
+	return parse_call_result(n, t, p, l, results);
+}
+
+/* ---- async calls (the per-node RPC slot) ---------------------------- */
+
+int wasp_call_async(wasp_node *n, const char *fn, const int32_t *argv,
+		    uint32_t argc)
+{
+	uint8_t req[2 + WASP_CALL_MAX_NAME_LEN + 4 * WASP_CALL_MAX_ARGS];
+	int len, rc;
+
+	if (!n || n->call_pending)
+		return WASP_E_ARG;
+	len = build_call_req(req, fn, argv, argc);
+	if (len < 0)
+		return len;
+	n->call_seq = n->seq = (uint8_t)(n->seq + 1);
+	rc = wasp_send_frame(n->fd, WASP_MSG_CALL, n->call_seq, req,
+			     (uint32_t)len);
+	if (rc != WASP_OK)
+		return rc;
+	n->call_pending = 1;
+	return WASP_OK;
+}
+
+int wasp_call_poll(wasp_node *n, int32_t results[WASP_CALL_MAX_RESULTS])
+{
+	if (!n)
+		return WASP_E_ARG;
+	if (!n->call_pending)
+		return WASP_E_ARG;
+
+	while (wasp_net_readable(n->fd, 0)) {
+		uint8_t t, s;
+		uint32_t l;
+		int rc = recv_frame(n, &t, &s, &l);
+
+		if (rc != WASP_OK) {
+			n->call_pending = 0;
+			return rc;
+		}
+		if (is_node_request(t)) {
+			rc = wasp_host_serve(n, t, s, n->rx, l);
+			if (rc != WASP_OK) {
+				n->call_pending = 0;
+				return rc;
+			}
+			continue;
+		}
+		if (s != n->call_seq) {
+			n->call_pending = 0;
+			return WASP_E_STREAM;
+		}
+		n->call_pending = 0;
+		return parse_call_result(n, t, n->rx, l, results);
+	}
+	return WASP_E_AGAIN;
 }

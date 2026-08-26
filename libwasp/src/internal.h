@@ -92,6 +92,10 @@ struct wasp_node {
 	uint8_t *rx;          /* rx_cap bytes; holds request + response */
 	uint32_t rx_cap;
 	char detail[WASP_DETAIL_MAX];
+
+	/* The async slot: one outstanding wasp_call_async per node. */
+	int call_pending;
+	uint8_t call_seq;
 };
 
 /*

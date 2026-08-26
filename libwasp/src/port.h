@@ -45,7 +45,21 @@ uint64_t wasp_now_ms(void);
 int wasp_net_connect(const char *host, uint16_t port, uint32_t timeout_ms);
 int wasp_net_send(int fd, const void *buf, size_t len);
 int wasp_net_recv_exact(int fd, void *buf, size_t len);
+/* 1 = at least one byte (or EOF/error) is waiting, 0 = nothing within
+ * timeout_ms. The nonblocking probe behind wasp_call_poll. */
+int wasp_net_readable(int fd, uint32_t timeout_ms);
 void wasp_net_shutdown(int fd);
 void wasp_net_close(int fd);
+
+/*
+ * UDP, for discovery: open a datagram socket bound to port (broadcast
+ * reception enabled), receive one datagram with the sender's address
+ * rendered as a dotted quad. recv returns the datagram length,
+ * WASP_E_TIMEOUT when nothing arrived, or WASP_E_SYS. Close the fd
+ * with wasp_net_close.
+ */
+int wasp_udp_open(uint16_t port);
+int wasp_udp_recv(int fd, void *buf, size_t cap, uint32_t timeout_ms,
+		  char *ip, size_t ip_cap);
 
 #endif /* WASP_PORT_H_ */

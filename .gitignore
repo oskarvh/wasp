@@ -5,6 +5,12 @@
 # python virtualenv
 /.venv/
 
+# vscode settings
+/.vscode/
+
+# Claude
+/.claude/
+
 # build output
 /build/
 /app/build/

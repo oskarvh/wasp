@@ -17,13 +17,20 @@ project(wasp LANGUAGES C)
 target_sources(app PRIVATE
   src/main.c
   src/led.c
-  src/rpc.c
-  src/net/net_thread.c
-  src/net/announce.c
-  src/agent/agent_thread.c
-  src/wamr/wamr_runtime.c
-  src/wamr/native_remote.c
+  src/net/netup.c
 )
+
+# Worker role: WAMR runtime, agent/executor threads, listening socket.
+if(CONFIG_WASP_WORKER)
+  target_sources(app PRIVATE
+    src/rpc.c
+    src/net/net_thread.c
+    src/net/announce.c
+    src/agent/agent_thread.c
+    src/wamr/wamr_runtime.c
+    src/wamr/native_remote.c
+  )
+endif()
 
 target_include_directories(app PRIVATE src)
 
@@ -32,11 +39,14 @@ if(CONFIG_WASP_PEER)
   target_sources(app PRIVATE
     ../libwasp/src/core.c
     ../libwasp/src/host.c
+    ../libwasp/src/discover.c
     ../libwasp/src/port_zephyr.c
+    src/peer/peer_api.c
   )
   target_include_directories(app PRIVATE ../libwasp/include ../libwasp/src)
-  # MCU-sized tables: 8 regions (~0.6 KiB) and a 32-entry event queue.
-  target_compile_definitions(app PRIVATE WASP_MAX_REGIONS=8 WASP_EVQ_CAP=32)
+  # MCU-sized tables: 8 regions (~0.6 KiB) and a 128-entry event queue
+  # (16 B each — the conductor tracks tile provenance through it).
+  target_compile_definitions(app PRIVATE WASP_MAX_REGIONS=8 WASP_EVQ_CAP=128)
 endif()
 
 if(CONFIG_WASP_PEER_SMOKE)
@@ -47,4 +57,14 @@ if(CONFIG_WASP_PEER_SMOKE)
   generate_inc_file_for_target(app
     ${CMAKE_CURRENT_SOURCE_DIR}/../tools/remote_module.wasm
     ${ZEPHYR_BINARY_DIR}/include/generated/remote_module.wasm.inc)
+endif()
+
+if(CONFIG_WASP_CONDUCTOR)
+  if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/mandelbrot_module.wasm)
+    message(FATAL_ERROR "WASP_CONDUCTOR needs tools/mandelbrot_module.wasm — run tools/build_test_module.sh")
+  endif()
+  target_sources(app PRIVATE src/peer/conductor.c)
+  generate_inc_file_for_target(app
+    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/mandelbrot_module.wasm
+    ${ZEPHYR_BINARY_DIR}/include/generated/mandelbrot_module.wasm.inc)
 endif()

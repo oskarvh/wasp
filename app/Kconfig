@@ -1,5 +1,15 @@
 menu "wasp"
 
+config WASP_WORKER
+	bool "Worker role: accept a coordinator and execute WASM modules"
+	default y
+	help
+	  The classic wasp node: WAMR runtime, agent + executor threads,
+	  the listening TCP socket, and ANNOUNCE broadcasts. Disable for
+	  a conductor-only build that spends its RAM on coordinating
+	  other nodes instead of running modules (also set CONFIG_WAMR=n
+	  there to drop the runtime).
+
 config WASP_AGENT_PORT
 	int "TCP port the agent listens on"
 	default 4242
@@ -101,6 +111,16 @@ config WASP_PEER_THREAD_STACK_SIZE
 	depends on WASP_PEER
 	default 4096
 
+config WASP_PEER_MAX_PEERS
+	int "Most simultaneous outbound peer connections"
+	depends on WASP_PEER
+	default 8
+	help
+	  Sizes the peer-API handle table: one wasp_node plus one
+	  WASP_PEER_RX_BUF receive buffer per slot (statically
+	  allocated; unreferenced tables are garbage-collected out of
+	  builds that do not use the peer API).
+
 config WASP_PEER_SMOKE
 	bool "Run the peer-role smoke test at boot"
 	depends on WASP_PEER
@@ -115,6 +135,31 @@ config WASP_PEER_SMOKE_HOST
 	string "Worker IP the smoke test dials"
 	depends on WASP_PEER_SMOKE
 	default "10.0.0.183"
+
+config WASP_CONDUCTOR
+	bool "Conductor demo: discover workers and render the Mandelbrot"
+	select WASP_PEER
+	help
+	  Boot-time demo of firmware-driven orchestration: listen for
+	  worker ANNOUNCE broadcasts, push the embedded Mandelbrot
+	  module to every free worker, host the framebuffer and work
+	  counter in this node's RAM, and print progress plus the
+	  finished fractal on the serial console. Needs
+	  tools/mandelbrot_module.wasm (tools/build_test_module.sh).
+
+config WASP_CONDUCTOR_DISCOVER_S
+	int "Seconds to listen for worker ANNOUNCEs"
+	depends on WASP_CONDUCTOR
+	default 8
+
+config WASP_CONDUCTOR_CHAOS
+	bool "Kill one worker's connection mid-render (resilience demo)"
+	depends on WASP_CONDUCTOR
+	help
+	  Once a quarter of the tiles are done, the conductor drops its
+	  connection to the last worker, then re-issues that worker's
+	  lost tiles to the survivors at the end — the firmware version
+	  of the Python demo's --chaos flag.
 
 config WASP_NET_THREAD_STACK_SIZE
 	int "Network handler thread stack size"

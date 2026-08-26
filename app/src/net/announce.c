@@ -11,6 +11,7 @@
 #include <zephyr/net/socket.h>
 #include <zephyr/sys/byteorder.h>
 
+#include "netup.h"
 #include "wasp.h"
 
 LOG_MODULE_REGISTER(wasp_announce, LOG_LEVEL_INF);
@@ -41,8 +42,10 @@ static void announce_thread_fn(void *a, void *b, void *c)
 	pkt[8] = sizeof(ANNOUNCE_BOARD) - 1;
 	memcpy(&pkt[9], ANNOUNCE_BOARD, sizeof(ANNOUNCE_BOARD) - 1);
 
-	/* Nothing to announce until the network is up. */
+	/* Nothing to announce until the network is up (take-and-give,
+	 * so other waiters — e.g. a conductor thread — run too). */
 	k_sem_take(&wasp_net_ready, K_FOREVER);
+	k_sem_give(&wasp_net_ready);
 
 	int sock = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 

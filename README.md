@@ -173,9 +173,11 @@ wasp/
 │       ├── main.c          # boot, queue setup, thread start
 │       ├── led.c           # status LED thread (patterns + IDENTIFY strobe)
 │       ├── rpc.c           # node->coordinator RPC slot (remote memory)
-│       ├── net/            # network handler thread + framing + ANNOUNCE broadcast
+│       ├── net/            # net bring-up (netup.c) + worker socket/framing + ANNOUNCE
 │       ├── agent/          # agent thread + protocol dispatch
-│       └── wamr/           # WAMR wrapper + executor + wasp.* host functions
+│       ├── wamr/           # WAMR wrapper + executor + wasp.* host functions
+│       └── peer/           # peer role: host-function API (peer_api.h), conductor
+│                           #   demo, boot smoke test — libwasp in firmware
 ├── deps/                   # west-managed dependencies (NOT committed)
 │   ├── zephyr/
 │   └── modules/            # hal_stm32, cmsis, wasm-micro-runtime, …
@@ -641,5 +643,14 @@ Phase 4 — research:
       a Nucleo booted, dialed a stock Pico, pushed a module from its
       own flash, and served that module's remote-memory RPCs from
       its own RAM (`CONFIG_WASP_PEER_SMOKE`). Nodes can now be
-      coordinators. Next: the firmware-driven conductor demo.
+      coordinators.
+      Step 3 landed 2026-07: the firmware-driven conductor demo
+      (`CONFIG_WASP_CONDUCTOR`) — a conductor-only Nucleo discovers
+      the Picos, pushes the Mandelbrot module from its own flash,
+      hosts the framebuffer in its own RAM, and renders 256×192 in
+      4.0 s across 5 workers, fractal on the serial console, no PC
+      in the loop. Async call slots + on-node discovery landed in
+      libwasp; the brain is C against the peer host-function API
+      (`app/src/peer/peer_api.h`). Next: the same brain as a WASM
+      module (peer API as WAMR natives).
 - [ ] More boards

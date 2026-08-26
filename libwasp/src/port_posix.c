@@ -1,4 +1,5 @@
 /* libwasp POSIX port: pthreads + BSD sockets. */
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -175,6 +176,15 @@ int wasp_net_recv_exact(int fd, void *buf, size_t len)
 	return WASP_OK;
 }
 
+int wasp_net_readable(int fd, uint32_t timeout_ms)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	int rc = poll(&pfd, 1, (int)timeout_ms);
+
+	/* HUP/ERR also count: the pending recv will surface the error. */
+	return rc > 0 && pfd.revents != 0 ? 1 : 0;
+}
+
 void wasp_net_shutdown(int fd)
 {
 	shutdown(fd, SHUT_RDWR);
@@ -183,4 +193,44 @@ void wasp_net_shutdown(int fd)
 void wasp_net_close(int fd)
 {
 	close(fd);
+}
+
+int wasp_udp_open(uint16_t port)
+{
+	struct sockaddr_in addr = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_ANY),
+		.sin_port = htons(port),
+	};
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	int one = 1;
+
+	if (fd < 0)
+		return WASP_E_SYS;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(fd);
+		return WASP_E_SYS;
+	}
+	return fd;
+}
+
+int wasp_udp_recv(int fd, void *buf, size_t cap, uint32_t timeout_ms,
+		  char *ip, size_t ip_cap)
+{
+	struct sockaddr_in src;
+	socklen_t slen = sizeof(src);
+	ssize_t len;
+
+	if (!wasp_net_readable(fd, timeout_ms))
+		return WASP_E_TIMEOUT;
+	len = recvfrom(fd, buf, cap, 0, (struct sockaddr *)&src, &slen);
+	if (len < 0)
+		return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR
+			       ? WASP_E_TIMEOUT
+			       : WASP_E_SYS;
+	if (ip && ip_cap > 0 &&
+	    !inet_ntop(AF_INET, &src.sin_addr, ip, (socklen_t)ip_cap))
+		return WASP_E_SYS;
+	return (int)len;
 }

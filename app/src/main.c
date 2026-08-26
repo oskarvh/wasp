@@ -17,6 +17,8 @@
 
 LOG_MODULE_REGISTER(wasp, LOG_LEVEL_INF);
 
+#ifdef CONFIG_WASP_WORKER
+
 #define WASP_QUEUE_DEPTH 8
 
 /*
@@ -92,6 +94,8 @@ int wasp_queue_error(const struct wasp_msg *req, uint8_t err, const char *detail
 	}
 	return wasp_queue_tx(req, WASP_MSG_ERROR, buf, len);
 }
+
+#endif /* CONFIG_WASP_WORKER */
 
 int main(void)
 {

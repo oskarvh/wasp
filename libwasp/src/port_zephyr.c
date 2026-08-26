@@ -134,12 +134,65 @@ int wasp_net_recv_exact(int fd, void *buf, size_t len)
 	return WASP_OK;
 }
 
+int wasp_net_readable(int fd, uint32_t timeout_ms)
+{
+	struct zsock_pollfd pfd = { .fd = fd, .events = ZSOCK_POLLIN };
+	int rc = zsock_poll(&pfd, 1, (int)timeout_ms);
+
+	/* HUP/ERR also count: the pending recv will surface the error. */
+	return rc > 0 && pfd.revents != 0 ? 1 : 0;
+}
+
 void wasp_net_shutdown(int fd)
 {
-	zsock_shutdown(fd, ZSOCK_SHUT_RDWR);
+	/* Zephyr only implements SHUT_RD (SHUT_WR/RDWR -> ENOTSUP).
+	 * That is all wasp_node_kill needs: recv sees EOF, requests
+	 * fail with E_CONN. No FIN reaches the peer — like a genuine
+	 * node loss, the other end finds out via its own timeout. */
+	zsock_shutdown(fd, ZSOCK_SHUT_RD);
 }
 
 void wasp_net_close(int fd)
 {
 	zsock_close(fd);
+}
+
+int wasp_udp_open(uint16_t port)
+{
+	struct sockaddr_in addr = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_ANY),
+		.sin_port = htons(port),
+	};
+	int fd = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	int one = 1;
+
+	if (fd < 0)
+		return WASP_E_SYS;
+	zsock_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	if (zsock_bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		zsock_close(fd);
+		return WASP_E_SYS;
+	}
+	return fd;
+}
+
+int wasp_udp_recv(int fd, void *buf, size_t cap, uint32_t timeout_ms,
+		  char *ip, size_t ip_cap)
+{
+	struct sockaddr_in src;
+	socklen_t slen = sizeof(src);
+	ssize_t len;
+
+	if (!wasp_net_readable(fd, timeout_ms))
+		return WASP_E_TIMEOUT;
+	len = zsock_recvfrom(fd, buf, cap, 0, (struct sockaddr *)&src, &slen);
+	if (len < 0)
+		return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR
+			       ? WASP_E_TIMEOUT
+			       : WASP_E_SYS;
+	if (ip && ip_cap > 0 &&
+	    !zsock_inet_ntop(AF_INET, &src.sin_addr, ip, ip_cap))
+		return WASP_E_SYS;
+	return (int)len;
 }

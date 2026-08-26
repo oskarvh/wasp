@@ -262,6 +262,27 @@ static void *fake_wait(void *arg)
 	return NULL;
 }
 
+/* Async scenario: answer CALL slow with one MEM_ADD mid-call, then a
+ * RESULT — with delays, so the coordinator's poll loop actually spins. */
+static void *fake_async(void *arg)
+{
+	int fd = (int)(intptr_t)arg;
+	uint8_t nseq = 0x30, rtype, rbuf[64], req[8];
+	uint32_t rlen;
+	uint8_t call_seq = fk_expect_call(fd, "slow");
+
+	usleep(100 * 1000);
+	le32(req, wasp_pack_ref(1, 32));
+	le32(req + 4, 9);
+	fk_rpc(fd, &nseq, WASP_MSG_MEM_ADD, req, 8, &rtype, rbuf, sizeof(rbuf),
+	       &rlen);
+	assert(rtype == WASP_MSG_MEM_DATA);
+	usleep(50 * 1000);
+	fk_result_i32(fd, call_seq, 7);
+	close(fd);
+	return NULL;
+}
+
 /* ---- coordinator-side driver --------------------------------------- */
 
 static uint16_t start_listener(int *lfd)
@@ -391,6 +412,37 @@ int main(void)
 
 	wasp_node_free(na);
 	wasp_node_free(nb);
+
+	/* -- async call: nonblocking poll loop ------------------------ */
+	wasp_node *nc = wasp_connect(ctx, "127.0.0.1", port, 5000);
+	int fdc = accept(lfd, NULL, NULL);
+	pthread_t fkc;
+
+	assert(nc && fdc >= 0);
+	pthread_create(&fkc, NULL, fake_async, (void *)(intptr_t)fdc);
+	le32(region1 + 32, 100);
+	CHECK(wasp_call_async(nc, "slow", NULL, 0) == WASP_OK,
+	      "async call sent");
+	CHECK(wasp_call_async(nc, "slow", NULL, 0) == WASP_E_ARG,
+	      "second async call on the slot refused");
+
+	int agains = 0;
+
+	for (;;) {
+		rc = wasp_call_poll(nc, res);
+		if (rc != WASP_E_AGAIN)
+			break;
+		agains++;
+		usleep(5 * 1000);
+	}
+	CHECK(rc == 1 && res[0] == 7, "async call completed via poll");
+	CHECK(agains > 0, "poll returned E_AGAIN while the call ran");
+	CHECK(region1[32] == 109, "MEM_ADD served from inside the poll loop");
+	pthread_join(fkc, NULL);
+	wasp_node_free(nc);
+	/* drain the async scenario's events */
+	while (wasp_poll_event(ctx, &ev, 10) == 1)
+		;
 	close(lfd);
 	wasp_ctx_free(ctx);
 

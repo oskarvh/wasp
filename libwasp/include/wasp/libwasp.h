@@ -42,6 +42,7 @@ enum {
 	WASP_E_TOOBIG = -104,     /* payload exceeds a buffer or the node's cap */
 	WASP_E_SYS = -105,        /* OS-level failure, see errno */
 	WASP_E_UNEXPECTED = -106, /* response type made no sense for the request */
+	WASP_E_AGAIN = -107,      /* async call still running, poll again */
 };
 
 const char *wasp_strerror(int err);
@@ -130,6 +131,20 @@ int wasp_unload(wasp_node *n);
 /* Returns the number of i32 results (>= 0) or a negative error. */
 int wasp_call(wasp_node *n, const char *fn, const int32_t *argv,
 	      uint32_t argc, int32_t results[WASP_CALL_MAX_RESULTS]);
+
+/*
+ * Async call: send the CALL and return immediately (one outstanding
+ * call per node — the node's executor is single-threaded anyway).
+ * wasp_call_poll then drains the connection without blocking: it
+ * services the node's remote-memory RPCs inline and, once the RESULT
+ * or ERROR frame arrives, completes with wasp_call's return
+ * convention. While the call is still running it returns
+ * WASP_E_AGAIN — interleave polls across nodes to conduct several
+ * workers from one thread.
+ */
+int wasp_call_async(wasp_node *n, const char *fn, const int32_t *argv,
+		    uint32_t argc);
+int wasp_call_poll(wasp_node *n, int32_t results[WASP_CALL_MAX_RESULTS]);
 
 /* ---- discovery ----------------------------------------------------- */
 

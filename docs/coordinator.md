@@ -272,15 +272,41 @@ Yes, with three honest caveats:
    free (full selftest suite still passes against the same build).
    The async RPC-slot table moved to step 3, where the multi-worker
    driver actually needs it.
-3. **Firmware-driven conductor demo**: conductor-only Nucleo build
-   (no WAMR → RAM headroom for a full 256×192 framebuffer). It
-   listens for worker ANNOUNCEs, connects to the Picos, pushes the
+3. **Firmware-driven conductor demo** — **done 2026-07-19.**
+   `CONFIG_WASP_CONDUCTOR` (`west build -b nucleo_f439zi app -d
+   build/conductor -- -DEXTRA_CONF_FILE=conductor.conf`): a
+   conductor-only Nucleo build (`CONFIG_WASP_WORKER=n`, no WAMR →
+   RAM headroom for the full 256×192 framebuffer) that listens for
+   worker ANNOUNCEs, connects to every free Pico, pushes the
    mandelbrot module *from its own flash* (one embedded module — the
-   embryo of the worker pool), hosts params/counter/framebuffer,
-   re-issues lost tiles. Display: serial console progress + final
-   framebuffer dump, PNG'd by a tiny script. Workers: zero changes.
-   The conductor brain is written in C **against the peer
-   host-function API shape** so step 4 can lift it into wasm.
+   embryo of the worker pool), hosts params/counter/framebuffer in
+   its own RAM, and prints progress plus the finished fractal as
+   ASCII art on the serial console. Workers: zero changes.
+   Measured: **96/96 tiles in 4.0 s across 5 stock Picos** (19–20
+   tiles each — the same 4-ish seconds the Linux coordinator gets),
+   `CONDUCTOR: PASS`. `CONFIG_WASP_CONDUCTOR_CHAOS=y` kills one
+   worker's connection mid-render: detected in <1 ms via E_CONN,
+   survivors absorb its share, lost tiles re-issue at the end.
+   What landed underneath:
+   - the **async RPC slot** (`wasp_call_async` / `wasp_call_poll` +
+     `WASP_E_AGAIN`): one thread conducts N workers, servicing their
+     remote-memory RPCs from the same nonblocking poll;
+   - `discover.c` went portable (UDP moved behind `port.h`), so
+     on-node discovery is the same code as on Linux;
+   - the **peer host-function API** (`app/src/peer/peer_api.h`):
+     `wasp_peer_discover/connect/load/call_async/poll` +
+     `wasp_export_region` + `wasp_peer_poll_event`, i32 handles —
+     the conductor brain (`conductor.c`) is written strictly against
+     it, so step 4 only swaps C for wasm;
+   - the worker role became `CONFIG_WASP_WORKER` (default y) with
+     network bring-up shared in `src/net/netup.c`.
+   Zephyr-side gotchas that cost the first two runs: the default
+   **ARP table holds 2 entries** (5 peers thrash it until all but two
+   connections starve into RPC timeouts — `CONFIG_NET_ARP_TABLE_SIZE=16`),
+   RX buffer pools need sizing for N concurrent streams (window cap +
+   bigger pool in `conductor.conf`), and `zsock_shutdown` only
+   implements `SHUT_RD` — which is exactly what `wasp_node_kill`
+   needs, and a dead-node-realistic kill besides (no FIN).
 4. **Coordinator brain in WAMR**: register the peer functions as WAMR
    natives; the brain becomes a ~2 KiB module, pushed and hot-swapped
    over the network — same render, swappable scheduling policy.
