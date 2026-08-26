@@ -1,0 +1,74 @@
+@startuml node-board
+' Smetana = PlantUML's built-in layout engine, so no graphviz install
+!pragma layout smetana
+title wasp node board — block diagram (STM32H723ZGT6 + KSZ8794CNX)
+skinparam shadowing false
+skinparam defaultTextAlignment center
+skinparam ArrowColor #333333
+skinparam ArrowFontSize 11
+skinparam rectangle {
+  BorderColor #444444
+  BackgroundColor #FCFCFC
+}
+skinparam frame {
+  BorderColor #999999
+  BackgroundColor #F4F4F4
+}
+
+frame "network edge — one upstream, two downstream" as NET {
+  rectangle "RJ45\n+ magnetics\n**upstream**" as J1
+  rectangle "RJ45\n+ magnetics\n**downstream A**" as J2
+  rectangle "RJ45\n+ magnetics\n**downstream B**" as J3
+}
+
+rectangle "**KSZ8794CNX**  ·  QFN-64\n10/100 managed switch\nports 1–3: PHY + MAC  ·  port 4: GMAC4\nnon-blocking store-and-forward · 1K MAC table\nbroadcast storm protection · self-address filter" as SW
+
+rectangle "**STM32H723ZGT6**  ·  LQFP144\nCortex-M7 @ 550 MHz, I+D cache\n1 MB flash · 564 KB SRAM\nEthernet MAC · OCTOSPI · USB FS" as MCU
+
+rectangle "**APS6408L-OBM**\n8 MB octal PSRAM\nWAMR linear memory\n(cached, CPU-only — no DMA)" as RAM
+
+frame "clock — 0 ohm choice, no respin" as CLK {
+  rectangle "25 MHz\ncrystal" as XTAL
+  rectangle "25 MHz oscillator\n**DNP** — fallback" as OSC
+  rectangle "**0 ohm select**\nR_A fitted / R_B DNP" as CLKSEL
+}
+
+frame "power" as PWR {
+  rectangle "**USB-C**\n5 V, no PD\n2 x 5.1k CC pulldowns" as USBC
+  rectangle "**XT30**\n5 V DC" as XT30
+  rectangle "OR-ing + protection\nSchottky pair or TPS2116\nreverse-polarity FET" as ORING
+  rectangle "**3.3 V buck**\nMCU · PSRAM · switch analog + I/O" as BUCK
+  rectangle "**1.2 V LDO**\nswitch analog + digital cores" as LDO
+}
+
+' ---- data paths ---------------------------------------------------
+J1 -down-> SW : port 1
+J2 -down-> SW : port 2
+J3 -down-> SW : port 3
+
+SW -down-> MCU : **RMII** (7 signals, incl.\n50 MHz REF_CLK from RXC4)\nport 4 <-> ETH MAC
+SW -down-> MCU : **SPI** (4) + reset\nboot config · MIB counters
+MCU -down-> RAM : **OCTOSPI** (11)\nmemory-mapped read/write
+USBC -left-> MCU : USB FS\nconsole · DFU
+
+' ---- clock --------------------------------------------------------
+XTAL -right-> SW : 25 MHz
+SW -right-> CLKSEL : REFCLKO 25 MHz
+OSC -down-> CLKSEL : alternative source
+CLKSEL -down-> MCU : **HSE**
+
+' ---- power --------------------------------------------------------
+USBC -down-> ORING : 5 V
+XT30 -down-> ORING : 5 V
+ORING -down-> BUCK
+BUCK -down-> LDO : 3.3 V
+
+note as N
+  The MCU is never in the forwarding path. The switch is
+  configured once over SPI at boot — storm protection,
+  self-address filtering, port enables — and forwards on
+  its own thereafter. No DSA, no tail tagging, no spanning
+  tree, nothing of ours in the Ethernet hot path.
+end note
+RAM .. N
+@enduml

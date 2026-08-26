@@ -626,7 +626,8 @@ Phase 4 — research:
       by instance. Today's fleet stays single-instance: the Pico W is
       at ~93% RAM and the F439's pool fits exactly one 64 KiB page.
       A purpose-built node board for this (STM32H723 + octal PSRAM +
-      Eth/WiFi) is sketched in [docs/hardware.md](docs/hardware.md).
+      a per-node Ethernet switch) is sketched in
+      [docs/hardware.md](docs/hardware.md).
 - [ ] Coordinator — `libwasp` C core with a Python binding on top,
       also embeddable in firmware so nodes can delegate pooled worker
       functions to idle peers with or without a dedicated coordinator

@@ -1,9 +1,11 @@
-# Protocol sequence diagrams
+# Diagrams
 
-Every message type in `app/src/protocol.h` appears in at least one
-scenario below. Sources are the `.puml` files in this directory; the
-checked-in `.svg` files are rendered from them. To regenerate after
-editing (needs Java, no install):
+Protocol sequence diagrams — every message type in
+`app/src/protocol.h` appears in at least one scenario below — plus the
+hardware block diagram for the future node board. Sources are the
+`.puml` files in this directory; the checked-in `.svg` files are
+rendered from them. To regenerate after editing (needs Java, no
+install):
 
 ```sh
 curl -sLo /tmp/plantuml.jar \
@@ -62,3 +64,13 @@ copy the uf2), and `ERROR(UNSUPPORTED)` on boards without a bootloader
 entry.
 
 ![reboot-reflash](reboot-reflash.svg)
+
+## Node board block diagram
+
+The purpose-built node board sketched in
+[hardware.md](../hardware.md): STM32H723 + octal PSRAM + a KSZ8794CNX
+switch giving every node three copper ports. Renders via PlantUML's
+built-in Smetana layout engine (`!pragma layout smetana`), so it needs
+no graphviz install either.
+
+![node board](node-board.svg)
