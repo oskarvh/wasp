@@ -25,11 +25,11 @@ rectangle "**KSZ8794CNX**  ·  QFN-64\n10/100 managed switch\nports 1–3: PHY +
 
 rectangle "**STM32H723ZGT6**  ·  LQFP144\nCortex-M7 @ 550 MHz, I+D cache\n1 MB flash · 564 KB SRAM\nEthernet MAC · OCTOSPI · USB FS" as MCU
 
-rectangle "**APS6408L-OBM**\n8 MB octal PSRAM\nWAMR linear memory\n(cached, CPU-only — no DMA)" as RAM
+rectangle "**APS6404L-3SQR-SN**\n8 MB quad PSRAM · SOP-8\nWAMR linear memory\n(cached, CPU-only — no DMA)" as RAM
 
 frame "clock — 0 ohm choice, no respin" as CLK {
   rectangle "25 MHz\ncrystal" as XTAL
-  rectangle "25 MHz oscillator\n**DNP** — fallback" as OSC
+  rectangle "25 MHz XO\nAbracon ASE\n**DNP** — fallback" as OSC
   rectangle "**0 ohm select**\nR_A fitted / R_B DNP" as CLKSEL
 }
 
@@ -48,7 +48,7 @@ J3 -down-> SW : port 3
 
 SW -down-> MCU : **RMII** (7 signals, incl.\n50 MHz REF_CLK from RXC4)\nport 4 <-> ETH MAC
 SW -down-> MCU : **SPI** (4) + reset\nboot config · MIB counters
-MCU -down-> RAM : **OCTOSPI** (11)\nmemory-mapped read/write
+MCU -down-> RAM : **OCTOSPI** peripheral, x4 (6)\nmemory-mapped read/write
 USBC -left-> MCU : USB FS\nconsole · DFU
 
 ' ---- clock --------------------------------------------------------

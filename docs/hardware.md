@@ -11,7 +11,8 @@ re-derived later.
 Settled:
 
 - **STM32H723ZGT6** — ~$11 @ qty 10, DigiKey (quoted 2026-08).
-- **Octal PSRAM over OCTOSPI** for WAMR linear memory.
+- **Quad PSRAM on the OCTOSPI peripheral** for WAMR linear memory —
+  SOP-8, no BGA (see [PSRAM part selection](#psram-part-selection)).
 - **KSZ8794CNX switch** — $6.22/unit, DigiKey (quoted 2026-08) —
   three copper ports (one upstream, two downstream) on an RMII link to
   the MCU. QFN-64 and its extra 1.2 V rail are both accepted.
@@ -86,7 +87,7 @@ flash, 564 KB internal RAM, Ethernet MAC, OCTOSPI.
   supported by the H7 MAC, and already the interface both fleet
   Nucleos run — so the `st,stm32h7-ethernet` side is proven silicon
   and proven driver. Budget: RMII (7) + switch SPI (4) + reset (1) +
-  octal PSRAM (11) + USB D+/D− (2) + SWD + UART console. Dropping the
+  quad PSRAM (6) + USB D+/D− (2) + SWD + UART console. Dropping the
   PHY's MDIO/MDC pair
   pays for the switch's SPI, and dropping WiFi returns a UART.
   LQFP144 is not close to full; LQFP100 (H723VGT6) would now fit too,
@@ -149,6 +150,40 @@ are 2 PHY + 1 MAC); the 5-port KSZ8795CLX buys a fourth we don't want.
   ±50 ppm reference and can *output* the 50 MHz RMII reference clock
   to the MAC (strap: 25 MHz OSC in, 50 MHz RMII clock out on RXC4).
   No second oscillator, no clock-source negotiation with the H723.
+
+### Magnetics
+
+Per the datasheet's §9, the line interface wants a plain 10/100
+transformer and nothing exotic:
+
+| | |
+| --- | --- |
+| turns ratio | 1 CT : 1 CT |
+| open-circuit inductance | ≥ 350 µH (100 mV, 100 kHz, 8 mA) |
+| insertion loss | ≤ 1.1 dB, 0.1–100 MHz |
+| HIPOT | ≥ 1500 V RMS |
+
+Two details specific to this part: an **integrated common-mode choke**
+is recommended ("for exceeding FCC requirements at line side"), and
+the **RX/TX centre taps must be kept separate on the chip side**. They
+do *not* need tying to analog power — the KSZ8794 biases and
+terminates internally — which removes the per-port bias network a
+discrete-PHY design would need.
+
+**Isolation is not the axis to economise on.** 1500 V RMS is an 802.3
+requirement, and it matters more here than usual: every node has its
+own wall supply, so without magnetics a chain of fifteen would bond
+all fifteen grounds together through the cabling. Every MagJack worth
+buying clears it; there is no cheaper non-isolated option worth
+considering.
+
+What actually moves the price is **integrated versus discrete**
+magnetics, and for a three-port board integrated wins clearly: three
+parts instead of six, one differential-routing stage removed
+(chip→jack rather than chip→transformer→jack), and less of the board
+edge consumed, which is the scarce resource here. Also **do not buy
+gigabit magnetics** — the copper ports are 10/100, so a 10/100/1000
+MagJack costs more for bandwidth the switch cannot use.
 
 ### Latency: the fan-out of two is what saves it
 
@@ -336,10 +371,98 @@ debugging of the wasp protocol possible without a tap.
 - **No WiFi means no mixed-transport story.** performance.md's ~8×
   WiFi-vs-Ethernet RPC comparison stays valid as measured history, but
   this board can't reproduce it. Existing Pico W nodes still can.
+- **The switch's LED pins are also its strap pins**, and the jack LED
+  circuits share them. `LED2_1` is the Port 4 RMII clock-mode strap —
+  pulled up, the switch sources the 50 MHz RMII reference from RXC4;
+  pulled down, it expects one from outside. `LED3[1:0]` and `LED1_0`
+  configure RGMII mode and speed similarly. A 330 Ω LED series
+  resistor to a rail will comfortably beat a 10 kΩ strap resistor at
+  reset, so **decide the strap levels first and then choose LED
+  polarity and resistor values to match**. The failure mode is
+  "Ethernet doesn't work" with nothing obviously wrong.
 - **The ARP-table gotcha still applies**, and is independent of
   topology: a conductor holding N peer connections needs
   `CONFIG_NET_ARP_TABLE_SIZE` raised from Zephyr's default of *two*
   (see `app/conductor.conf`).
+
+## PSRAM part selection
+
+**APS6404L-3SQR-SN** (AP Memory) — 64 Mbit (8 MB), quad (x1/x4) SDR,
+133 MHz, 2.7–3.6 V, **SOP-8**.
+
+### Why not octal
+
+Because octal PSRAM does not exist in a hand-solderable package. The
+x8 market has standardised on one 24-ball, 6×8 mm miniBGA footprint —
+AP Memory, ISSI and Winbond all ship it and nothing else. This is not
+a sourcing gap to shop around; there is no part to find.
+
+That turns out not to matter, because **the memory-mapped write came
+from the peripheral, not the device width.** The reason this board
+needs an H72x/H73x rather than an H743 is that the H743's QUADSPI
+memory-maps reads only, while the OCTOSPI peripheral memory-maps
+reads *and* writes — and OCTOSPI drives x1, x2, x4 and x8 devices
+alike. A quad PSRAM on the OCTOSPI peripheral is transparently
+read/write mapped exactly as an octal one would be. The MCU choice
+stands unchanged; only the memory narrows.
+
+The quad part gives up nothing else: same 8 MB, same 2.7–3.6 V single
+rail, same self-managed refresh, and it is a jellybean — SOP-8, about
+a dollar, stocked everywhere, the same part that sits on countless
+RP2040 boards.
+
+### What it costs
+
+| | quad @ 133 MHz SDR | octal @ 133 MHz DTR |
+| --- | ---: | ---: |
+| peak bandwidth | ~66 MB/s | ~266 MB/s |
+| 32 B cache-line fill | ~590 ns | ~200 ns |
+
+So **4× the bandwidth and ~3× the miss latency** — real, and paid only
+on cache misses. Whether that is visible depends entirely on how well
+the H723's D-cache holds an interpreter's working set, which is an
+empirical question and one the bring-up plan already answers: the
+Nucleo + breakout step measures it before any copper is committed. The
+constraints section above argues bandwidth won't bottleneck before the
+CPU does; this is the measurement that confirms or refutes it.
+
+If it refutes it, the BGA part (**APS6408L-3OBM-BA**, 2.7–3.6 V — note
+the `-3`; the bare `-OBM` is the 1.8 V version and would need a third
+rail plus level translation) is the upgrade path.
+
+### Don't try to hedge with dual footprints
+
+Tempting, given the 0 Ω philosophy elsewhere on this board, and wrong
+here. The quad signals are a subset of the octal ones, so both
+footprints could share nets — but the unpopulated one then hangs off
+the bus as an unterminated stub. At octal DTR speeds (~1.9 ns unit
+interval) the usable stub length is a couple of millimetres, which no
+sane placement achieves. If hedging is genuinely wanted, the H723 has
+two OCTOSPI instances (verify on the datasheet), so the two parts can
+sit on separate buses with no shared nets — at a cost in pins and
+area, both of which this board has spare.
+
+### Practical notes
+
+- **KiCad already has everything.** The stock symbol
+  `Memory_RAM:APS1604M-SQRx-SN` carries the identical SOP-8 pinout
+  (CE#=1, SO/SIO1=2, SIO2=3, VSS=4, SI/SIO0=5, SCLK=6, SIO3=7,
+  VDD=8) and the right footprint,
+  `Package_SO:SOIC-8_3.9x4.9mm_P1.27mm`. Copy it into the project
+  library as `APS6404L-3SQR-SN` and fix the value and datasheet — the
+  stock symbol's description quotes its 1.8 V sibling's supply range,
+  which is not this part's.
+- **tCEM still applies.** The refresh is self-managed internally, but
+  chip select still cannot stay low indefinitely.
+  `OCTOSPI_DCR3.MAXTRAN` and the `REFRESH` field must be set from the
+  part's tCEM, or the failure mode is silent corruption that presents
+  as random memory faults. AN5050 has the calculation.
+- **Validate before committing copper.** Community reports of PSRAM
+  on H723 OCTOSPI include deadlocks and debugger crashes. If the
+  interface fights back, HyperRAM is the fallback — the same
+  peripheral speaks HyperBus natively — but note that HyperRAM is
+  BGA-only too, so it is a last resort on this board rather than a
+  free swap.
 
 ## Power
 
@@ -436,6 +559,11 @@ Mechanics worth getting right the first time:
   A6↔B6 and A7↔B7 so the cable works either way up. USB 2.0-only
   receptacles do it internally; the 16-pin ones do not, and a
   one-orientation USB port is a maddening bug to chase.
+- **`SBU1`/`SBU2` go nowhere.** They carry Alternate Mode sideband
+  signals (DisplayPort AUX and friends) and debug-accessory mode; a
+  USB 2.0-only device with no PD uses neither. Leave them open, but
+  put explicit no-connect flags on both so ERC passes and the intent
+  reads as deliberate rather than forgotten.
 - **ESD protection on the data pair** — a USBLC6-2SC6 or equivalent,
   ~$0.15, non-negotiable on a connector humans touch.
 - **Keep a UART console on a header.** A USB console needs the USB
@@ -455,9 +583,16 @@ cleanly, and it is not worth a respin to find out.
 both sources into an 0 Ω select:
 
 - **R_A** (fitted by default) connects the switch's REFCLKO to the
-  MCU's HSE input;
-- **R_B** (DNP) connects a **dedicated 25 MHz oscillator**, itself
-  DNP, in its place.
+  MCU's OSC_IN;
+- **R_B** (DNP) puts a **25 MHz oscillator** — Abracon
+  `ASE-25.000MHZ-L-K-T` (±30 ppm) or the `-C-` ±50 ppm variant, itself
+  DNP — there instead.
+
+A second crystal was considered for this slot, on the grounds that it
+reuses a part already on the board and adds no BOM line. Rejected:
+that argument is weak for a part that is never fitted, and it costs
+the three things below, all of which land exactly when you would be
+populating it.
 
 PCB area is the cheapest thing on this board. A do-not-place line in
 the BOM is a strictly better outcome than a respin, and if REFCLKO
@@ -469,39 +604,243 @@ applies anywhere else a cheap footprint buys out a risk.
 Note that USB does not enter into this: HSI48 + CRS covers the 48 MHz
 domain regardless of which HSE source wins.
 
+### The switch's 25 MHz reference — the one clock that matters
+
+Everything Ethernet times off this crystal, so it is the only
+load-bearing oscillator on the board. Datasheet §10:
+
+| | |
+| --- | --- |
+| frequency | 25.000000 MHz |
+| tolerance | ≤ ±50 ppm |
+| load capacitance | ≤ 27 pF |
+| ESR | ≤ 40 Ω |
+
+**Two traps here, and the jellybean part falls into both.** The common
+3225 25 MHz crystals — Abracon ABM8G and its lookalikes — are **60 Ω
+ESR**, half again over the limit. An oscillator driven below its
+required negative-resistance margin starts unreliably, and ESR climbs
+as it gets colder, so this is the classic "fine on the bench, dead in
+the garage in January" failure. The second trap is reading ±50 ppm as
+an initial-tolerance number: it is the **total** budget, so a ±30 ppm
+part that drifts another ±30 ppm over temperature is out of spec at
+±60 ppm. Buy on the total.
+
+**Pick: Epson TSX-3225 series**, which has 25 MHz variants that clear
+both — e.g. `TSX-3225 25.0000MF10P-C0` (±10 ppm, CL 18 pF, 40 Ω),
+where the tight initial tolerance leaves the whole temperature budget
+free, or `TSX-3225 25.00M-N0YYYYG30RGB` (±30 ppm, CL 20 pF, 30 Ω) if
+its ±30 ppm turns out to be inclusive of temperature — worth checking,
+because that part's ESR margin is the better of the two. KiCad has the
+footprint (`Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm`). Load caps are
+2 × (CL − ~4 pF stray) each: ~27 pF for an 18 pF part, ~33 pF for a
+20 pF one.
+
+**The escape hatch, if the crystal is fussy at bring-up:** XI takes a
+3.3 V oscillator directly — "when using a 3.3 V oscillator, this is
+the input from the oscillator" — with XO left floating. No respin
+needed to change your mind.
+
+### The MCU's HSE is not load-bearing
+
+Worth stating plainly, because it sets how much to care about the
+0 Ω select above: **nothing on this board needs an accurate HSE.** The
+RMII clock comes from the switch, so MAC timing does not depend on it;
+USB runs from HSI48 + CRS; the UART console tolerates a percent. HSE
+feeds the core PLL and nothing else, and the PLL has no accuracy
+requirement.
+
+So the fallback ladder is three deep, not two: REFCLKO, then the DNP
+oscillator, then — costing no parts at all — the H723's internal
+64 MHz HSI. Populate the oscillator only if REFCLKO proves actively
+dirty rather than merely imperfect.
+
+Why the oscillator rather than a second crystal:
+
+- **The firmware does not change.** Both REFCLKO and an XO present a
+  CMOS clock on OSC_IN, so HSE runs in **bypass** mode either way. A
+  crystal would force HSE into crystal mode, meaning a second clock
+  configuration on a fleet whose boards may be populated differently.
+- **OSC_OUT (PH1) stays free.** Bypass mode never drives it. A crystal
+  needs both pins, so it would reserve PH1 for a part that is
+  probably never fitted.
+- **No gain-margin analysis.** An XO is a closed, validated loop. A
+  crystal on the H723's HSE wants an AN2867 gm-margin check — and the
+  entire premise of this slot is *the primary clock did not work out*,
+  which is the wrong moment to be evaluating a second oscillator's
+  startup behaviour.
+
+Against that, the oscillator costs an extra BOM line and roughly a
+dollar more per unit — neither of which is paid while it stays DNP.
+
+The select is therefore genuinely one resistor: R_A or R_B, one clock
+into OSC_IN, bypass mode, nothing else changes. Put a 22–33 Ω series
+damping resistor at the source end of the 25 MHz trace.
+
+Note the footprints are **not** interchangeable despite both being
+3.2×2.5 mm 4-pad: pin 4 is ground on a crystal and VDD on an
+oscillator, so the XO needs its own
+(`Oscillator:Oscillator_SMD_Abracon_ASE-4Pin_3.2x2.5mm`, symbol
+`Oscillator:ASE-xxxMHz`). The AN2867 discipline still applies to the
+switch's crystal, where the ≤40 Ω ESR limit lives.
+
 ### Rails
 
 5 V in → **3.3 V buck** (MCU, PSRAM, switch analog and VDDIO) → **1.2 V
 LDO** for the switch cores. Two regulators, both ordinary.
+
+A single **green power LED on the 3V3 rail** — `LTST-C191KGKT`, 0603,
+with 1 kΩ in series for ~1.3 mA — is the whole indicator story.
+Putting it on 3V3 rather than 5 V means it proves the input is
+present, the switch is on *and* the buck is running: three things for
+one part.
+
+Mind the forward voltage. "Green" splits into two families: 571 nm
+AlInGaP (Vf ≈ 2.0 V, which is this part) and 525 nm InGaN "pure
+green" (Vf ≈ 3.0–3.2 V, which behaves like blue). On a 3.3 V rail the
+high-Vf sort leaves almost nothing across the resistor, so brightness
+tracks Vf spread and temperature rather than the current you designed
+for — Lite-On's blue in the same family is specified at 3.3 V and
+would not light at all here. With 1 kΩ and this part's 1.9–2.4 V
+spread the current stays between 0.9 and 1.4 mA.
+
+The 1.2 V rail is smaller than it looks. Table 6-1 of the switch
+datasheet puts `VDD12A + VDD12D` at **35 mA typical** at 100BASE-TX
+with all ports at 100% utilisation — the worst of any mode listed
+(auto-negotiation 34 mA, 10BASE-T 29 mA, EEE idle 27 mA). So the LDO
+burns (3.3 − 1.2) × 35 mA ≈ **74 mW**, which a SOT-23-5 dissipates
+without noticing. No thermal design, no buck needed.
+
+**Pick: TI `LP5907MFX-1.2`** (250 mA, SOT-23-5, KiCad symbol in
+`Regulator_Linear`). The deciding spec is PSRR, not current: this rail
+feeds the PHYs' *analog* cores and its input comes from a switching
+buck, so ripple rejection at the TPSM863253's switching frequency is
+the thing that matters. The LP5907 is a low-noise/high-PSRR part for
+about $0.50. `AP2112K-1.2` (600 mA, ~$0.25, also in KiCad) is the
+cost pick and perfectly serviceable — it just rejects less.
+
+Three details from the same table:
+
+- **Tolerance is ±5%** — `VDD12A`/`VDD12D` operate over 1.140–1.260 V.
+  Any ±2% LDO clears it comfortably; a sloppy one might not.
+- **`VDD12A` wants a filtered feed.** The datasheet calls the 1.2 V
+  pins "filtered 1.2 V input voltage" without saying where the filter
+  goes; splitting analog from digital at the bead is standard practice
+  inferred from the pin naming rather than a stated requirement, and
+  Microchip's EVB-KSZ8794 schematic would settle it. The arrangement:
+
+  ```
+  LDO 1.2 V ──┬──────────────────► VDD12D  (pins 21, 33, 59)
+              │                    100 nF per pin + 4.7 µF bulk
+              └──[ BLM18PG221SN1D ]──┬────► VDD12A  (pin 1)
+                                     └───── 1 µF + 100 nF
+  ```
+
+  `BLM18PG221SN1D` is 220 Ω @ 100 MHz, 0603, **0.1 Ω DCR**, 1.4 A —
+  the DCR costs ~2 mV at this rail's current, against a ±60 mV budget.
+  Beware Murata's numbering: it is two significant figures plus a
+  multiplier, so `221` is 220 Ω but `600` is **60 Ω**, not 600. The
+  board's existing `BLM21PG300SN1D` is 30 Ω.
+
+  Note the division of labour. A bead rated at 100 MHz is worth maybe
+  10–20 Ω at 10 MHz and almost nothing at 1 MHz, so it does not touch
+  the buck's switching ripple — that is entirely the LDO's PSRR, which
+  is why the LDO choice mattered. The bead's job is keeping the
+  digital cores' high-frequency hash out of the analog one. And keep
+  the capacitance after it modest (1 µF, not 47 µF): a bead plus a
+  large low-ESR ceramic is an underdamped LC that peaks rather than
+  attenuates near resonance.
+
+  Give `VDDAT` (pins 2, 12, 60) the same treatment off the 3.3 V rail
+  — it is the analog transceiver supply. One bead per `VDDAT` pin
+  rather than one shared bead gives each transceiver group its own
+  filtered feed, which is worth the two extra parts on a multi-port
+  device. Four beads total.
+
+### Decoupling
+
+Every filter capacitor goes on the **pin side** of its bead. The bead
+is only a series impedance; the shunt capacitor after it is what makes
+a low-pass, and since the bead blocks HF in both directions, that
+capacitor is also the only thing that can source the die's fast
+transient current. Filter element and local reservoir in one, so it
+sits closest to the pin with the shortest possible via to ground.
+Capacitance ahead of the bead is just bulk on the main rail — already
+covered by the regulator output caps.
+
+A bead creates a **new isolated net**, so every beaded pin is its own
+island and needs a full decoupling set; pins sharing an unfiltered net
+share one bulk cap but still get an HF cap each. That gives 16
+capacitors around the switch:
+
+| pin(s) | bead | caps |
+| --- | --- | --- |
+| 1 — `VDD12A` | own bead | 100 nF + 1 µF |
+| 2 — `VDDAT` | own bead | 100 nF + 1 µF |
+| 12 — `VDDAT` | own bead | 100 nF + 1 µF |
+| 60 — `VDDAT` | own bead | 100 nF + 1 µF |
+| 21, 33, 59 — `VDD12D` | shared net | 100 nF *at each pin* + one 4.7 µF |
+| 27, 39, 56 — `VDDIO` | shared net | 100 nF *at each pin* + one 4.7 µF |
+
+Order outward from each beaded pin: 100 nF, then 1 µF, then the bead.
+The bulk cannot be shared across beaded pins — one upstream cap would
+force each pin's transient current back through its own bead, which is
+precisely what the bead exists to stop.
+
+Plus 1 µF on the LDO input and output — the LP5907 needs at least
+1 µF on its output to be stable.
+
+Two sizing notes: use **0402 for the 100 nF** parts, where the lower
+parasitic inductance is worth more than the easier soldering, and
+**0603 for the 1 µF and larger**, because DC-bias derating on small
+ceramics is brutal — a 1 µF 0402 X5R rated 6.3 V can lose half its
+capacitance at 3.3 V. Spec 16 V or 25 V X7R and the derating mostly
+goes away. And keep the post-bead capacitance to the values above
+rather than piling on bulk: bead plus a large low-ESR ceramic is an
+underdamped LC that peaks near resonance instead of attenuating.
+- **Sequencing solves itself.** The datasheet specifies no power-up
+  order between the rails, and deriving 1.2 V from 3.3 V through an
+  LDO guarantees 3.3 V leads anyway.
+
+Totting the switch up: (107 mA analog + 11 mA I/O + 35 mA core) off
+3.3 V is ~153 mA, or **~0.5 W** — which is what the budget above
+already assumed, so that estimate survives contact with the datasheet.
+Note the figures are typical at 25 °C with no maximum column given,
+and were measured with port 4 in RGMII rather than RMII mode.
 
 ## Rest of system
 
 | block | part | ~cost | note |
 | --- | --- | ---: | --- |
 | MCU | STM32H723ZGT6 | $11 | DigiKey, qty 10, 2026-08 |
-| PSRAM | APS6408L-OBM (8 MB, octal) | $2–3 | 11 signals, easy routing, memory-mapped R/W via OCTOSPI |
+| PSRAM | **APS6404L-3SQR-SN** (8 MB, quad) | ~$1 | 2.7–3.6 V, SOP-8, jellybean; octal BGA is the upgrade path |
 | Switch | KSZ8794CNX | $6.22 | DigiKey, 2026-08; 3 copper + port 4 RMII; QFN-64; SPI-managed |
-| Jacks | 3 × RJ45 w/ integrated magnetics | $6 | the real area cost; LEDs off the switch |
-| Clock | 25 MHz ±50 ppm crystal | <$1 | switch sources the 50 MHz RMII refclk from it |
+| Jacks | 3 × HanRun HR911105A | ~$4 | 10/100 MagJack, 1500 V, LEDs; KiCad symbol + footprint both stock |
+| Clock | Epson TSX-3225 25 MHz | <$1 | ESR ≤40 Ω required — the jellybean 3225 parts are 60 Ω |
+| Clock (DNP) | Abracon ASE-25.000MHZ XO | — | fallback for the MCU HSE; not fitted by default |
 | USB | USB-C receptacle + USBLC6-2SC6 ESD | ~$0.30 | 5 V in, CDC-ACM console, DFU; 5.1 kΩ CC pulldowns |
 | DC in | XT30 | ~$0.30 | polarized; reverse-polarity FET behind it |
 | Power OR-ing | Schottky pair or TPS2116 mux | $0.20–1 | mux only if priority is worth a dollar |
-| Power | 3.3 V buck + 1.2 V LDO for the switch core | $2–3 | two rails, not one |
+| Power | TPSM863253 3.3 V buck + LP5907MFX-1.2 LDO | $2–3 | 3 A buck against a ~450 mA load; 1.2 V rail only ~35 mA |
+| Filtering | BLM18PG221SN1D beads | <$0.20 | analog-rail feeds for VDD12A and VDDAT |
 
-BOM lands around **$29–31** plus a 4-layer PCBA run — up from the
+BOM lands around **$27–29** plus a 4-layer PCBA run — up from the
 ~$20–25 single-jack estimate, essentially all of it jacks and switch,
 less the WiFi module. Both major parts are now real quotes rather than
-ballparks. No BGA anywhere, so still the cheap assembly tier, with QFN
-as the only leadless part.
+ballparks. **No BGA anywhere** — the QFN-64 switch is the only
+non-leaded part, and the board is otherwise hand-solderable on a
+hotplate. Ordinary 4-layer fab, cheapest assembly tier.
 
 ## Open questions
 
 Most of the original list is now answered — from DS00002134C, or by
 decision. What's left:
 
-1. **Real power draw with three links up**, to replace the estimated
-   ~1.6 W budget above and size the buck and LDO. The datasheet's
-   power tables need reading properly rather than grepping.
+1. **The MCU's real power draw.** The switch side is now measured
+   from the datasheet (~0.5 W, above), so what is left of the ~1.6 W
+   budget estimate is the H723 at 550 MHz with the cache and OCTOSPI
+   busy. That one wants measuring on the Nucleo rather than reading,
+   since it depends on what the firmware actually does.
 2. **Storm-protection tuning.** The rate is a percentage of bandwidth;
    what percentage still lets ANNOUNCE broadcasts and ARP through
    comfortably at fleet scale is an empirical question, and the wrong

@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "KSZ8794CNXCC")(type "KiCad")(uri "${KIPRJMOD}/../lib/KSZ8794CNXCC/KSZ8794CNXCC.kicad_sym")(options "")(descr ""))
+)

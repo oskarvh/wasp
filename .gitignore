@@ -29,3 +29,14 @@
 
 __pycache__/
 *.pyc
+
+# KiCad — per-user state, backups and autosaves
+*.kicad_prl
+*-backups/
+*.lck
+\#auto_saved_files\#
+fp-info-cache
+
+# Third-party KiCad libraries pulled from SnapEDA / Component Search Engine.
+# Not redistributed here — re-fetch per hardware/README.md.
+/hardware/lib/

@@ -1,0 +1,164 @@
+(kicad_sch
+	(version 20250114)
+	(generator "eeschema")
+	(generator_version "9.0")
+	(uuid "8112a7f8-6a52-4f6e-80c5-c0e3be484a00")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 21.59 35.56)
+		(size 44.45 25.4)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0.0000)
+		)
+		(uuid "6ac47cc4-c825-428f-90a4-bb2c6d5f8443")
+		(property "Sheetname" "mcu"
+			(at 21.59 34.8484 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "mcu.kicad_sch"
+			(at 21.59 61.5446 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(property "Field2" ""
+			(at 21.59 35.56 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(instances
+			(project "wasp_node_board"
+				(path "/8112a7f8-6a52-4f6e-80c5-c0e3be484a00"
+					(page "2")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 21.59 99.06)
+		(size 44.45 25.4)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0.0000)
+		)
+		(uuid "7201c3b2-4220-481e-ad1e-bbbf1933faa6")
+		(property "Sheetname" "ethernet"
+			(at 21.59 98.3484 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "eth.kicad_sch"
+			(at 21.59 125.0446 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(property "Field2" ""
+			(at 21.59 99.06 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(instances
+			(project "wasp_node_board"
+				(path "/8112a7f8-6a52-4f6e-80c5-c0e3be484a00"
+					(page "4")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 21.59 67.31)
+		(size 44.45 25.4)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0.0000)
+		)
+		(uuid "84c5fa1f-c7c3-4e8a-aae5-80440cd36d77")
+		(property "Sheetname" "power"
+			(at 21.59 66.5984 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "power.kicad_sch"
+			(at 21.59 93.2946 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(property "Field2" ""
+			(at 21.59 67.31 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(instances
+			(project "wasp_node_board"
+				(path "/8112a7f8-6a52-4f6e-80c5-c0e3be484a00"
+					(page "3")
+				)
+			)
+		)
+	)
+	(sheet_instances
+		(path "/"
+			(page "1")
+		)
+	)
+	(embedded_fonts no)
+)

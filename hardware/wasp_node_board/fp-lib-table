@@ -1,0 +1,6 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "KSZ8794CNXCC")(type "KiCad")(uri "${KIPRJMOD}/../lib/KSZ8794CNXCC")(options "")(descr ""))
+  (lib (name "ACM2012-361-2P-T002")(type "KiCad")(uri "${KIPRJMOD}/../lib/ACM2012-361-2P-T002/ACM2012-361-2P-T002")(options "")(descr ""))
+  (lib (name "TPSM863253RDXR")(type "KiCad")(uri "${KIPRJMOD}/../lib/TPSM863253RDXR/TPSM863253RDXR")(options "")(descr ""))
+)
