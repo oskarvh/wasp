@@ -4114,7 +4114,7 @@
 	)
 	(wire
 		(pts
-			(xy 69.85 60.96) (xy 95.25 60.96)
+			(xy 73.66 60.96) (xy 95.25 60.96)
 		)
 		(stroke
 			(width 0)
@@ -4224,7 +4224,7 @@
 	)
 	(wire
 		(pts
-			(xy 69.85 50.8) (xy 69.85 60.96)
+			(xy 73.66 50.8) (xy 73.66 60.96)
 		)
 		(stroke
 			(width 0)
@@ -4484,7 +4484,7 @@
 	)
 	(wire
 		(pts
-			(xy 49.53 50.8) (xy 69.85 50.8)
+			(xy 49.53 50.8) (xy 73.66 50.8)
 		)
 		(stroke
 			(width 0)
@@ -6975,7 +6975,7 @@
 				(justify right)
 			)
 		)
-		(property "Value" "LED"
+		(property "Value" "LTST-C191KGKT"
 			(at 151.13 164.1474 90)
 			(effects
 				(font

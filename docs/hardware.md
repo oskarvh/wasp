@@ -371,15 +371,38 @@ debugging of the wasp protocol possible without a tap.
 - **No WiFi means no mixed-transport story.** performance.md's ~8×
   WiFi-vs-Ethernet RPC comparison stays valid as measured history, but
   this board can't reproduce it. Existing Pico W nodes still can.
-- **The switch's LED pins are also its strap pins**, and the jack LED
-  circuits share them. `LED2_1` is the Port 4 RMII clock-mode strap —
-  pulled up, the switch sources the 50 MHz RMII reference from RXC4;
-  pulled down, it expects one from outside. `LED3[1:0]` and `LED1_0`
-  configure RGMII mode and speed similarly. A 330 Ω LED series
-  resistor to a rail will comfortably beat a 10 kΩ strap resistor at
-  reset, so **decide the strap levels first and then choose LED
-  polarity and resistor values to match**. The failure mode is
-  "Ethernet doesn't work" with nothing obviously wrong.
+- **The switch's LED pins are also its strap pins** (`Ipu/O`: input
+  while reset is asserted, sampled and latched at release, output
+  thereafter). The hazard is that the jack LED circuit is present
+  during sampling, and LED drive polarity is fixed — "LED is ON when
+  the output is LOW" — so LEDs must hang off 3.3 V through a resistor
+  into the pin, which fights any pull-down. A 330 Ω LED resistor
+  against a 10 kΩ pull-down settles the node at ~1.26 V, in the
+  undefined band between VIL and VIH: the LED wins and the strap is
+  ignored.
+
+  **Resolved by not strapping at all.** Register 86 (0x56) sets the
+  same configuration over SPI — bits [1:0] select the Port 4
+  interface (`11` RGMII default, `01` RMII) and bit [7] picks the RMII
+  clock source — so both go in the boot-time SPI routine and every
+  jack LED can be wired the ordinary way with no strap resistors.
+  Before that code runs the switch sits in RGMII, which is harmless
+  because nothing drives Port 4 yet; `LED2_1` and `LED2_0` default
+  high, which are the wanted values anyway. The second matters at
+  power-up, since REFCLKO feeds the MCU's HSE before any SPI can run.
+
+- **Two pins do need resistors, neither of them an LED.** `SPIQ` picks
+  SPI against MDC/MDIO — its internal pull-down already selects SPI
+  client mode, but the datasheet requires an explicit external
+  resistor, so fit a 10 kΩ pull-down (it is also the MISO line). And
+  `ISET` wants **12.4 kΩ 1%** to ground, which sets the PHY transmit
+  current for a 1:1 transformer — the tolerance is load-bearing.
+
+- **Bring-up order:** hold `RST_N` low, release, SPI-configure
+  (register 86 for RMII plus internal clock, storm protection,
+  self-address filtering, port enables), then start the MAC. Worth
+  verifying whether changing register 86 bits [1:0] after boot needs
+  a soft reset.
 - **The ARP-table gotcha still applies**, and is independent of
   topology: a conductor holding N peer connections needs
   `CONFIG_NET_ARP_TABLE_SIZE` raised from Zephyr's default of *two*
@@ -751,7 +774,15 @@ Three details from the same table:
   large low-ESR ceramic is an underdamped LC that peaks rather than
   attenuates near resonance.
 
-  Give `VDDAT` (pins 2, 12, 60) the same treatment off the 3.3 V rail
+  **The jacks' chassis pin is not optional.** On the HR911105A, package
+pin 8 is `CHS GND` — the return for the jack's internal 75 Ω +
+1000 pF line-side termination — even though stock KiCad's symbol
+leaves it unnamed and pin 7 labelled "NC". Left floating, that
+termination has no return path and does nothing. The HanRun datasheet
+says to connect it to PCB ground, so that is what the board does:
+pin 8 and the shell straight to `GND` on all three jacks.
+
+Give `VDDAT` (pins 2, 12, 60) the same treatment off the 3.3 V rail
   — it is the analog transceiver supply. One bead per `VDDAT` pin
   rather than one shared bead gives each transceiver group its own
   filtered feed, which is worth the two extra parts on a multi-port
@@ -773,19 +804,27 @@ island and needs a full decoupling set; pins sharing an unfiltered net
 share one bulk cap but still get an HF cap each. That gives 16
 capacitors around the switch:
 
-| pin(s) | bead | caps |
-| --- | --- | --- |
-| 1 — `VDD12A` | own bead | 100 nF + 1 µF |
-| 2 — `VDDAT` | own bead | 100 nF + 1 µF |
-| 12 — `VDDAT` | own bead | 100 nF + 1 µF |
-| 60 — `VDDAT` | own bead | 100 nF + 1 µF |
-| 21, 33, 59 — `VDD12D` | shared net | 100 nF *at each pin* + one 4.7 µF |
-| 27, 39, 56 — `VDDIO` | shared net | 100 nF *at each pin* + one 4.7 µF |
+Checklist §3.0 is prescriptive here, and the unit of filtering is the
+**supply domain, not the pin**: one bead per domain, four in total.
 
-Order outward from each beaded pin: 100 nF, then 1 µF, then the bead.
-The bulk cannot be shared across beaded pins — one upstream cap would
-force each pin's transient current back through its own bead, which is
-precisely what the bead exists to stop.
+| domain | pins | fed through |
+| --- | --- | --- |
+| `VDDAT` 3.3 V analog | 2, 12, 60 | bead from +3V3 |
+| `VDDIO` 3.3 V I/O | 27, 39, 56 | bead from +3V3 |
+| `VDD12A` 1.2 V analog | 1 | bead from +1V2 |
+| `VDD12D` 1.2 V digital | 21, 33, 59 | bead from +1V2 |
+
+Per-pin beads are wrong twice over: the checklist asks for one bead per
+domain, and the symbol ties each domain's pins together anyway, so
+parallel beads would simply divide the impedance.
+
+Then, on top of that:
+
+- **0.1 µF on every power pin**, 0603 or smaller — ten of them.
+- **4.7–22 µF bulk on _both_ sides of every bead.** This is the part
+  easily missed: a bead blocks HF in both directions, so the load side
+  needs its own charge store and a 1 µF does not meet the stated
+  minimum.
 
 Plus 1 µF on the LDO input and output — the LP5907 needs at least
 1 µF on its output to be stable.
@@ -807,6 +846,49 @@ Totting the switch up: (107 mA analog + 11 mA I/O + 35 mA core) off
 already assumed, so that estimate survives contact with the datasheet.
 Note the figures are typical at 25 °C with no maximum column given,
 and were measured with port 4 in RGMII rather than RMII mode.
+
+## Expansion: Arduino Uno R3 + a 2×10
+
+The board carries **Arduino Uno R3 headers** (`MCU_Module:Arduino_UNO_R3`
+symbol, `Module:Arduino_UNO_R3_WithMountingHoles` footprint — one part
+with the non-uniform D7/D8 gap and the mounting holes already in it),
+so X-NUCLEO and generic Uno shields plug in. The full ST Zio superset
+was considered and dropped: ~112 pins is mostly area, and the promise
+of drop-in Nucleo compatibility is already broken by this board using
+those pins for Ethernet and PSRAM.
+
+**Two Arduino pins must take ST's alternate rather than the default**,
+because the defaults collide with functions this board cannot give up.
+Both alternates are solder-bridge options on the Nucleo itself, so
+nothing is being invented:
+
+| pin | default | use instead | why |
+| --- | --- | --- | --- |
+| A5 | PF10 | **PB8** | PF10 is `PSRAM_CLK`; PB8 is also I2C SCL, which is how a real Uno R3 behaves anyway |
+| D11 | PA7 | **PB5** | PA7 is `ETH_CRS_DV`. UM2407 note 3 spells out the same conflict on the Nucleo, and Zephyr's `arduino_r3_connector.dtsi` already specifies PB5 |
+
+With those, **all of D0–D15 and A0–A5 are available**, including
+Arduino SPI on D11–D13 — which only works because the switch went on
+SPI3 rather than SPI1 back when RMII took PA7 and PG11.
+
+What the board gives up, checked against UM2407's Zio tables: the
+**SDMMC block** (PC10–12, PD2 — consumed by SPI3 to the switch), so SD
+shields are out, plus a scattering of extended Zio I/O (A8, D18, D26,
+D55, D61–D63). Eleven dead positions out of seventy-five.
+
+Alongside sits a **2×10 expansion header** carrying what Arduino does
+not: `USART3` on PD8/PD9 (the Nucleo's own console, so Zephyr's
+console config ports over, and the always-works serial path when USB
+has not enumerated), `I2C2` on PF0/PF1 (deliberately not PB10/PB11,
+which would collide with SPI2's clock), `SPI2` on PB10/PB14/PB15 with
+CS on PB12, FDCAN1 on PD0/PD1, three ADC1 channels and three timer
+channels. Three grounds and 3V3.
+
+Gotcha for later: A2 lands on **`PC3_C`**. The LQFP144 bonds out only
+the `_C` pad of PC2/PC3, and `SYSCFG_PMCR`'s `PC3SO` bit works the
+analog switch between it and the digital PC3 — closed by default, so
+it behaves as an ordinary GPIO, and only needs touching to use the pad
+as a direct analog input.
 
 ## Rest of system
 
