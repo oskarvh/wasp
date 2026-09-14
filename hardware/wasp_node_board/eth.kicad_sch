@@ -2068,21 +2068,19 @@
 			(in_bom yes)
 			(on_board yes)
 			(property "Reference" "R"
-				(at 0.762 0.508 0)
+				(at 0 0 90)
 				(effects
 					(font
-						(size 1.27 1.27)
+						(size 1.016 1.016)
 					)
-					(justify left)
 				)
 			)
 			(property "Value" "R_Small"
-				(at 0.762 -1.016 0)
+				(at 1.778 0 90)
 				(effects
 					(font
 						(size 1.27 1.27)
 					)
-					(justify left)
 				)
 			)
 			(property "Footprint" ""
@@ -7869,7 +7867,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 267.97 52.07 0)
 			(effects
 				(font
@@ -8076,7 +8074,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 123.19 135.89 0)
 			(effects
 				(font
@@ -8223,7 +8221,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 50.8 165.1 0)
 			(effects
 				(font
@@ -8705,7 +8703,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 118.11 128.27 0)
 			(effects
 				(font
@@ -9328,7 +9326,7 @@
 				)
 			)
 		)
-		(property "Footprint" "Package_DFN_QFN:QFN-64-1EP_8x8mm_P0.4mm_EP6.5x6.5mm_ThermalVias"
+		(property "Footprint" "KSZ8794CNXCC:IC_KSZ8794CNXCC"
 			(at 85.09 120.65 0)
 			(effects
 				(font
@@ -9792,7 +9790,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 129.54 156.21 0)
 			(effects
 				(font
@@ -9999,7 +9997,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 38.1 80.01 0)
 			(effects
 				(font
@@ -10076,7 +10074,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 118.11 133.35 0)
 			(effects
 				(font
@@ -10288,7 +10286,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 275.59 132.08 0)
 			(effects
 				(font
@@ -10531,7 +10529,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 123.19 130.81 0)
 			(effects
 				(font
@@ -11240,7 +11238,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 118.11 138.43 0)
 			(effects
 				(font
@@ -11517,7 +11515,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 267.97 132.08 0)
 			(effects
 				(font
@@ -11594,7 +11592,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 267.97 90.17 0)
 			(effects
 				(font
@@ -12256,7 +12254,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 275.59 52.07 0)
 			(effects
 				(font
@@ -12473,7 +12471,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 123.19 140.97 0)
 			(effects
 				(font
@@ -12955,7 +12953,7 @@
 				(hide yes)
 			)
 		)
-		(property "Description" ""
+		(property "Description" "Resistor, small symbol"
 			(at 275.59 90.17 0)
 			(effects
 				(font
