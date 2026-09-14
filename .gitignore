@@ -39,4 +39,6 @@ fp-info-cache
 
 # Third-party KiCad libraries pulled from SnapEDA / Component Search Engine.
 # Not redistributed here — re-fetch per hardware/README.md.
-/hardware/lib/
+/hardware/lib/*
+# ...except libraries we derived ourselves, which are ours to commit.
+!/hardware/lib/Arduino_UNO_R3_Headers/

@@ -5896,7 +5896,27 @@
 		)
 		(uuid "fde5dcfc-0dd5-4af9-9578-ee1330710f79")
 	)
-	(label "TX1_p"
+	(label "RX2_P"
+		(at 113.03 102.87 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "00b6772b-b49e-4108-8aae-4aab0ae568e7")
+	)
+	(label "RX3_P"
+		(at 113.03 115.57 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "05e488b0-e049-4378-9479-74a857049178")
+	)
+	(label "TX1_P"
 		(at 113.03 95.25 0)
 		(effects
 			(font
@@ -5905,6 +5925,16 @@
 			(justify left bottom)
 		)
 		(uuid "3349e190-ec1b-4f56-8f6b-7c5c9b8a53ef")
+	)
+	(label "TX3_P"
+		(at 113.03 120.65 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "57bcbe87-a4d8-4648-8c64-49066d1f3a5f")
 	)
 	(label "1V2D_filtered"
 		(at 113.03 77.47 0)
@@ -5916,7 +5946,7 @@
 		)
 		(uuid "6b663329-e9fe-4a43-b3cd-112ad43b4a11")
 	)
-	(label "TX1_n"
+	(label "TX1_N"
 		(at 113.03 97.79 0)
 		(effects
 			(font
@@ -5925,6 +5955,26 @@
 			(justify left bottom)
 		)
 		(uuid "72ee4b72-28ea-4108-bd0d-990b50e6a4e8")
+	)
+	(label "TX2_P"
+		(at 113.03 107.95 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "88256f08-9cb7-41bd-873d-f77c35aba879")
+	)
+	(label "RX2_N"
+		(at 113.03 105.41 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "aadfa867-17ea-48f1-bf0c-9dc90ffecf2b")
 	)
 	(label "3V3D_filtered"
 		(at 120.65 20.32 0)
@@ -5936,7 +5986,7 @@
 		)
 		(uuid "b7ccc476-eb67-4422-93e7-f01d8f8ab879")
 	)
-	(label "RX1_p"
+	(label "RX1_P"
 		(at 113.03 90.17 0)
 		(effects
 			(font
@@ -5945,6 +5995,36 @@
 			(justify left bottom)
 		)
 		(uuid "ba969b90-96a6-42f4-8da4-8a8df136b997")
+	)
+	(label "TX3_N"
+		(at 113.03 123.19 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "c3ccdb20-78b9-4ad3-9d1e-10a7c792afe4")
+	)
+	(label "RX3_N"
+		(at 113.03 118.11 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "c99f860f-aad5-4eb9-87f7-7602b4dd7ab8")
+	)
+	(label "TX2_N"
+		(at 113.03 110.49 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "d0090796-76cd-4616-8a70-7e3ad8d7ae8c")
 	)
 	(label "1V2A_filtered"
 		(at 113.03 80.01 0)
@@ -5956,7 +6036,7 @@
 		)
 		(uuid "f56fbf84-eb61-4142-b778-94f8e9ebb76a")
 	)
-	(label "RX1_n"
+	(label "RX1_N"
 		(at 113.03 92.71 0)
 		(effects
 			(font
@@ -8080,6 +8160,7 @@
 				(font
 					(size 1.27 1.27)
 				)
+				(hide yes)
 			)
 		)
 		(property "LCSC" "C140214"
@@ -8709,6 +8790,7 @@
 				(font
 					(size 1.27 1.27)
 				)
+				(hide yes)
 			)
 		)
 		(property "LCSC" "C140214"
@@ -10080,6 +10162,7 @@
 				(font
 					(size 1.27 1.27)
 				)
+				(hide yes)
 			)
 		)
 		(property "LCSC" "C140214"
@@ -10535,6 +10618,7 @@
 				(font
 					(size 1.27 1.27)
 				)
+				(hide yes)
 			)
 		)
 		(property "LCSC" "C140214"
