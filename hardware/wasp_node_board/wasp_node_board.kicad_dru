@@ -1,0 +1,11 @@
+(version 1)
+
+# TPSM863253RDXR (U4) — the buck module's own pin spacing is tighter than the
+# board-wide 0.2 mm netclass clearance: pad 1 (+5V) to pad 7 (FB) and pad 4
+# (GND) to pad 5 (PG) sit 0.1577 mm apart in TI's land pattern. That is package
+# geometry, not a routing choice, and it still clears OSH Park's 0.127 mm
+# manufacturing minimum by ~24%. Scoped to U4 so it cannot quietly relax
+# clearance anywhere else on the board.
+(rule "U4 package pad spacing"
+	(constraint clearance (min 0.15mm))
+	(condition "A.memberOfFootprint('U4') && B.memberOfFootprint('U4')"))

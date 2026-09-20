@@ -913,6 +913,53 @@ ballparks. **No BGA anywhere** — the QFN-64 switch is the only
 non-leaded part, and the board is otherwise hand-solderable on a
 hotplate. Ordinary 4-layer fab, cheapest assembly tier.
 
+## Fabrication: OSH Park 4-layer
+
+Ordered from OSH Park's 4-layer prototype service, which is **FR408, not
+standard FR4** — Dk ≈ 3.7 rather than 4.3, so impedance calculated with FR4's
+value comes out wrong. The stackup in the board file carries their published
+numbers: 1.7 mil outer copper, **7.87 mil FR408HG 2113 prepreg**, 0.68 mil
+inner copper, 39 mil FR408HR core, ENIG finish, 1.6 mm nominal.
+
+Design rules follow their published minimums: 5 mil track and clearance,
+10 mil drill, 4 mil annular ring, 15 mil board-edge keepout, 4 mil solder mask
+web, 3 mil mask misalignment.
+
+**Impedance control applies to seven pairs only** — USB D± and the six
+Ethernet MDI pairs, both routed at **0.33 mm / 0.20 mm**. That geometry solves
+to ~99 Ω differential, which is on target for the MDI pairs and inside USB's
+90 Ω ±15%, so one geometry serves both. RMII needs no impedance control: it is
+a 50 MHz source-synchronous parallel bus over a few centimetres. Nor does the
+OCTOSPI bus, provided it stays under ~30 mm — at 133 MHz SDR the skew budget
+is ~3.7 ns against roughly 5.6 ps/mm of propagation, so length matching is
+irrelevant here in a way it would not be on DDR.
+
+Note that OSH Park's *published* stackup over-predicts impedance: measured
+cross-sections put the prepreg nearer 0.177 mm with a lower effective Dk, and
+KiCad's calculator does not model solder mask. Both push real impedance down,
+so a calculated 99 Ω likely lands nearer 92–95 Ω — still inside tolerance for
+both, and a reason to err wide rather than narrow.
+
+### Two rule values that are ours, not theirs
+
+Worth flagging, because someone will otherwise read the whole rule set as
+gospel from the fab:
+
+- **`min_hole_to_hole` = 0.2 mm.** OSH Park publishes no hole-to-hole figure.
+  The original 0.254 mm was a guess ("at least the minimum drill") and it
+  failed U4's thermal-via array, where a 0.5 mm pitch with 0.254 mm drills
+  leaves 0.246 mm between holes. TI's own land pattern uses that spacing.
+- **The `U4 package pad spacing` rule** in `wasp_node_board.kicad_dru`
+  relaxes clearance to 0.15 mm, scoped by `memberOfFootprint('U4')`. The
+  TPSM863253's pad 1↔7 and pad 4↔5 gaps are 0.1577 mm in TI's land pattern —
+  package geometry no routing can change, and still ~24% above the 0.127 mm
+  fab floor. Scoping it to the one part keeps the board-wide 0.2 mm intact.
+
+Two constraints DRC cannot enforce, to handle by hand: **internal planes must
+be positive polarity** (copper lines, not voids), and **annular rings are
+required on every via** regardless of layer connection — so do not let KiCad
+remove unconnected inner-layer pads.
+
 ## Open questions
 
 Most of the original list is now answered — from DS00002134C, or by
