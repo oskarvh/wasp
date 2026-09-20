@@ -17542,7 +17542,7 @@
 			(pinfunction "SHIELD")
 			(pintype "passive")
 			(thermal_bridge_angle 45)
-			(uuid "b70b1947-f12c-421a-9643-7226f49aadf8")
+			(uuid "4d4d8c44-9e12-4bdd-a3a4-0dde8909331a")
 		)
 		(pad "S1" smd roundrect
 			(at 5.11 -0.825 270)
@@ -17553,7 +17553,7 @@
 			(pinfunction "SHIELD")
 			(pintype "passive")
 			(thermal_bridge_angle 45)
-			(uuid "b70b1947-f12c-421a-9643-7226f49aadf8")
+			(uuid "a72b900d-bfd4-4ec3-ac38-8701be74c7d9")
 		)
 		(pad "S1" smd roundrect
 			(at 5.11 3.105 270)
@@ -17564,7 +17564,7 @@
 			(pinfunction "SHIELD")
 			(pintype "passive")
 			(thermal_bridge_angle 45)
-			(uuid "b70b1947-f12c-421a-9643-7226f49aadf8")
+			(uuid "7fd9a437-3400-42b6-a137-b4e99e45d523")
 		)
 		(embedded_fonts no)
 		(model "${KICAD9_3DMODEL_DIR}/Connector_USB.3dshapes/USB_C_Receptacle_GCT_USB4110.step"
