@@ -1,0 +1,27 @@
+# Copyright (c) 2026 Oskar von Heideken
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Microchip KSZ8794CNX 3-port 10/100 managed Ethernet switch, reached over
+  its SPI client interface (SPI mode 0, max 25 MHz).
+
+  This is not a Zephyr Ethernet switch driver — the switch fabric forwards
+  without any host involvement. The node exists so the application can fix
+  up the handful of registers whose reset-strap defaults are wrong for the
+  board, above all the port 4 interface mode: the strap pins read RGMII and
+  the board is wired RMII.
+
+compatible: "wasp,ksz8794"
+
+include: spi-device.yaml
+
+properties:
+  reset-gpios:
+    type: phandle-array
+    description: |
+      RST# (active low).
+
+      Optional, and normally left undriven: boards that hold RST# with an
+      RC need no help, and on a board whose HSE is fed from the switch's
+      REFCLKO, asserting this while the MCU runs on HSE stops the MCU's own
+      clock. See CONFIG_WASP_KSZ8794_HW_RESET.

@@ -326,13 +326,48 @@ register bits at reset — enough for basic operation, but storm
 protection and self-address filtering need real register writes, so
 SPI it is.
 
-That gives the v1 firmware story, and it is a small one:
+That gives the v1 firmware story. It turned out to be smaller than
+the list below, and one item on it is not optional at all:
 
-- a **boot-time SPI config routine** — enable broadcast storm
-  protection and self-address filtering, set port enables, done. On
-  the order of twenty register writes. This is configuration, not
-  forwarding: after it returns, the MCU is a plain node on its own
-  switch and never touches a frame it didn't send.
+- a **boot-time SPI config routine** (`app/src/net/ksz8794.c`). This is
+  configuration, not forwarding: after it returns, the MCU is a plain
+  node on its own switch and never touches a frame it didn't send.
+
+  The one mandatory write is **port 4's interface mode**. The strap pins
+  that select it, LED3[1:0], both have internal pull-ups and so read
+  `11` = RGMII; on this board they drive J5's RJ45 LEDs through R22/R23,
+  so nothing pulls them down. The board is wired RMII. Until register 86
+  (0x56) bits[1:0] say `01`, port 4 neither speaks RMII nor emits the
+  50 MHz reference clock the MCU's MAC runs on, and not one frame moves.
+  Measured, not theorised: before the write, DHCP never completes; after
+  it, the board gets a lease in about 6 s.
+
+  Two documentation traps are worth knowing. The data sheet's register
+  map (Table 4-2) lists 0x56–0x58 as factory-test registers — it was
+  copied from the 5-port KSZ8795 and labels two blocks "Port 4"; the
+  detailed descriptions and the functional text both have 0x56 as Port 4
+  Interface Control 6. And section 3.5.1.1 claims 8-bit SPI opcodes
+  0x03/0x02, contradicting its own figures 3-7/3-8: the real frame is a
+  3-bit opcode, a 12-bit address, a turnaround bit, then 8 data bits, so
+  the header is `(op << 13) | (addr << 1)`. Linux's `ksz8795_spi.c`
+  agrees with the figures.
+
+  The switch does **not** need starting — register 1 bit[0] resets to 1
+  — and the SW4 port already resets to 100 Mbps full duplex, matching
+  the fixed link below.
+
+  Self-address filtering is deliberately *not* enabled. It drops frames
+  whose source matches the switch MAC on egress, which is right for a
+  daisy chain that can loop a broadcast back; but with the MCU's own MAC
+  configured there, every frame the MCU transmits also matches on
+  egress, and the data sheet never says whether the ingress port is
+  exempt. It waits for a second node to test a chain with.
+
+- a **clock-tree detail the switch forces on the MCU**: every SPI1/2/3
+  on the H7 takes its kernel clock from PLL1_Q, and the HSI-only bring-up
+  build runs no PLL. SPI3 (and SPI2, since SPI123SEL is one shared RCC
+  field) must be reparented onto CKPER = HSI, or `spi_stm32_init()` fails
+  the domain-clock select and the management bus never initialises.
 - the MCU's RMII link declared as a **fixed link** — Zephyr 4.4's
   `ethernet-phy-fixed-link` compatible with `default-speeds`, since
   there is no PHY to auto-negotiate with on that side — on top of the
@@ -436,7 +471,7 @@ RP2040 boards.
 
 ### What it costs
 
-| | quad @ 133 MHz SDR | octal @ 133 MHz DTR |
+| | quad @ 84 MHz SDR | octal @ 133 MHz DTR |
 | --- | ---: | ---: |
 | peak bandwidth | ~66 MB/s | ~266 MB/s |
 | 32 B cache-line fill | ~590 ns | ~200 ns |
@@ -930,7 +965,7 @@ Ethernet MDI pairs, both routed at **0.33 mm / 0.20 mm**. That geometry solves
 to ~99 Ω differential, which is on target for the MDI pairs and inside USB's
 90 Ω ±15%, so one geometry serves both. RMII needs no impedance control: it is
 a 50 MHz source-synchronous parallel bus over a few centimetres. Nor does the
-OCTOSPI bus, provided it stays under ~30 mm — at 133 MHz SDR the skew budget
+OCTOSPI bus, provided it stays under ~30 mm — at 84 MHz SDR the skew budget
 is ~3.7 ns against roughly 5.6 ps/mm of propagation, so length matching is
 irrelevant here in a way it would not be on DDR.
 

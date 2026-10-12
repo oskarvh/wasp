@@ -161,6 +161,26 @@ config WASP_CONDUCTOR_CHAOS
 	  lost tiles to the survivors at the end — the firmware version
 	  of the Python demo's --chaos flag.
 
+config WASP_KSZ8794_STORM_PROTECT
+	bool "Enable broadcast storm protection on the switch's external ports"
+	default y
+	help
+	  Limits ingress broadcast traffic on the three external ports to the
+	  KSZ8794's reset-default rate of 1% of 100BT (74 64-byte blocks per
+	  50 ms). Port 4, the MCU side, is deliberately left unlimited so that
+	  wasp's own broadcast ANNOUNCE discovery is never throttled.
+
+config WASP_KSZ8794_HW_RESET
+	bool "Pulse the switch's RST# at boot"
+	help
+	  Normally unnecessary: R6/C32 hold RST# low for roughly 100 ms at
+	  power-on, well past the 10 ms the data sheet requires, and every
+	  register this firmware writes is idempotent on a warm restart.
+
+	  Dangerous once the clock tree is moved to HSE, because HSE is fed
+	  from the switch's REFCLKO: holding the switch in reset then stops
+	  the clock the CPU is running from. Only enable while on HSI.
+
 config WASP_NET_THREAD_STACK_SIZE
 	int "Network handler thread stack size"
 	default 4096

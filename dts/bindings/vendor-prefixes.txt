@@ -1,0 +1,3 @@
+# Vendor prefixes for out-of-tree wasp boards. Keeps the devicetree lint
+# from flagging "wasp,..." compatibles as an unknown vendor.
+wasp	wasp (https://github.com/oskarvh/wasp)

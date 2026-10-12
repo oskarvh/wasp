@@ -1,0 +1,17 @@
+/*
+ * Console over USB-C CDC-ACM instead of USART3. Pairs with
+ * boards/wasp_node_cdc.conf — see that file for the invocation.
+ */
+
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc-acm-uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
+
+/ {
+	chosen {
+		zephyr,console = &cdc_acm_uart0;
+		zephyr,shell-uart = &cdc_acm_uart0;
+	};
+};

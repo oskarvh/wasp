@@ -1,0 +1,330 @@
+/*
+ * wasp node board, rev V1 — STM32H723ZGT6 + KSZ8794CNX 3-port switch
+ * + 8 Mbyte quad PSRAM.
+ *
+ * Copyright (c) 2026 Oskar von Heideken
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Every pin here comes from hardware/wasp_node_board/; docs/hardware.md has
+ * the design rationale. Three things make this board more than a relabelled
+ * Nucleo-H723ZG, and each is commented where it appears:
+ *
+ *   1. The RMII side is wired MAC-to-MAC into a switch — no PHY, no MDIO.
+ *   2. HSE is bypass-fed from that switch's REFCLK0, so the clock tree
+ *      depends on the switch. Build 1 therefore runs from HSI.
+ *   3. There is a PSRAM on OCTOSPI1 for WASM linear memory.
+ */
+
+/dts-v1/;
+#include <st/h7/stm32h723Xg.dtsi>
+#include <st/h7/stm32h723zgtx-pinctrl.dtsi>
+#include <zephyr/dt-bindings/clock/stm32h7_clock.h>
+
+/ {
+	model = "wasp node board rev V1";
+	compatible = "wasp,wasp-node";
+
+	chosen {
+		zephyr,console = &usart3;
+		zephyr,shell-uart = &usart3;
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,dtcm = &dtcm;
+		zephyr,canbus = &fdcan1;
+	};
+
+	leds: leds {
+		compatible = "gpio-leds";
+
+		status_led: led_0 {
+			/* D4, yellow. PB0 drives the anode through R20. */
+			gpios = <&gpiob 0 GPIO_ACTIVE_HIGH>;
+			label = "Status";
+		};
+	};
+
+	aliases {
+		led0 = &status_led;
+	};
+
+	/*
+	 * There is no PHY and no MDIO bus on this board. The MCU's RMII pins
+	 * run MAC-to-MAC into port 4 of the KSZ8794, and the switch is
+	 * configured over SPI3 (see &spi3) instead of MDIO.
+	 *
+	 * st,stm32-ethernet-common declares phy-handle as required, so the MAC
+	 * must be given something. A fixed-link PHY is not a workaround here,
+	 * it is the accurate description: the link is a PCB trace at 100M full
+	 * duplex with no autonegotiation and no way to go down. phy_fixed_link
+	 * reports link-up immediately, which is what brings the carrier on.
+	 */
+	eth_phy: ethernet-phy {
+		compatible = "ethernet-phy-fixed-link";
+		default-speeds = "100BASE Full-Duplex";
+		status = "okay";
+	};
+};
+
+/*
+ * Build 1 runs from HSI at 64 MHz, on purpose.
+ *
+ * HSE on this board is bypass-fed from the KSZ8794's REFCLK0 through R26
+ * (R25 selects a DNP oscillator instead). Enabling HSE therefore makes the
+ * MCU's entire clock tree depend on the switch having come up first — and if
+ * REFCLK0 is not running, the HSE-ready poll in SystemClock_Config spins
+ * before any application code executes. The symptom is a board that takes
+ * SWD but never prints, with nothing on the console to say why.
+ *
+ * So: prove power, flash, SWD, GPIO, console and Ethernet on HSI, confirm
+ * REFCLK0 with a scope on PH0 (or just watch Ethernet work, since the RMII
+ * 50 MHz on PA1 comes from the same switch), then switch to the block below.
+ *
+ * To move to 550 MHz, delete this &clk_hsi/&rcc pair and use:
+ *
+ *	&clk_hse {
+ *		hse-bypass;			// PH0 driven, PH1 unconnected
+ *		clock-frequency = <DT_FREQ_M(25)>;
+ *		status = "okay";
+ *	};
+ *
+ *	&pll {
+ *		div-m = <5>;			// 25 / 5   = 5 MHz ref  (1-16 MHz OK)
+ *		mul-n = <110>;			//  5 * 110 = 550 MHz VCO (wide range)
+ *		div-p = <1>;			// SYSCLK   = 550 MHz
+ *		div-q = <4>;			//           137.5 MHz
+ *		div-r = <2>;			//           275   MHz
+ *		clocks = <&clk_hse>;
+ *		status = "okay";
+ *	};
+ *
+ *	&rcc {
+ *		clocks = <&pll>;
+ *		clock-frequency = <DT_FREQ_M(550)>;
+ *		d1cpre = <1>;
+ *		hpre = <2>;			// HCLK 275   MHz
+ *		d1ppre = <2>;			// APB3 137.5 MHz
+ *		d2ppre1 = <2>;			// APB1 137.5 MHz
+ *		d2ppre2 = <2>;			// APB2 137.5 MHz
+ *		d3ppre = <2>;			// APB4 137.5 MHz
+ *	};
+ *
+ * Two things must survive that move, or Ethernet breaks again:
+ *
+ *   - Keep &clk_hsi enabled, or repoint &perck. CKPER feeds SPI2/SPI3's
+ *     kernel clock (see &spi3), and the switch's management bus is what
+ *     puts port 4 into RMII in the first place. Alternatively hand SPI123
+ *     back to PLL1_Q, which does exist once the block above is live.
+ *   - Never assert the switch's RST#. HSE is bypass-fed from the same
+ *     chip's REFCLKO through R26, so resetting the switch while the CPU
+ *     runs on an HSE-derived PLL stops the clock the CPU is executing
+ *     from. CONFIG_WASP_KSZ8794_HW_RESET is off by default for this
+ *     reason and must stay off here.
+ */
+&clk_hsi {
+	status = "okay";
+};
+
+/* USB runs from HSI48 + CRS, so it needs no accurate HSE either. */
+&clk_hsi48 {
+	status = "okay";
+};
+
+&rcc {
+	clocks = <&clk_hsi>;
+	clock-frequency = <DT_FREQ_M(64)>;
+	d1cpre = <1>;
+	hpre = <1>;	/* HCLK 64 MHz — above the 25 MHz the ETH DMA needs */
+	d1ppre = <1>;
+	d2ppre1 = <1>;
+	d2ppre2 = <1>;
+	d3ppre = <1>;
+};
+
+/*
+ * CKPER = HSI. This exists purely so SPI3 has a kernel clock: SPI1/2/3 on
+ * the H7 all default to PLL1_Q, and build 1 runs no PLL at all, so without
+ * this the switch's management bus is clocked from a stopped PLL and every
+ * transfer times out.
+ */
+&perck {
+	clocks = <&rcc STM32_SRC_HSI_KER CKPER_SEL(0)>;
+	status = "okay";
+};
+
+/* VCAP is populated (C38, C42), so the core runs from the internal LDO. */
+&pwr {
+	power-supply = "ldo";
+};
+
+/* Console: J9.3 = PD8 (TX), J9.4 = PD9 (RX). A bare ST-Link V2 has no VCP,
+ * so this wants a 3V3 USB-TTL dongle on the expansion header. CDC-ACM over
+ * the board's own USB-C is the alternative — see boards/wasp_node_cdc.conf.
+ */
+&usart3 {
+	pinctrl-0 = <&usart3_tx_pd8 &usart3_rx_pd9>;
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	status = "okay";
+};
+
+/* Second UART on the other header: J8.3 = PB6 (TX), J8.4 = PB7 (RX). */
+&lpuart1 {
+	pinctrl-0 = <&lpuart1_tx_pb6 &lpuart1_rx_pb7>;
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	status = "okay";
+};
+
+/*
+ * KSZ8794 management port. The switch is a slave on SPI3 and this is the
+ * only way to configure it: broadcast-storm limiting, self-address
+ * filtering, and port-4 RMII mode (register 0x56) all go over this bus.
+ *
+ * ETH_RSTn (PD3) is a plain GPIO rather than a reset-gpios property because
+ * there is no switch driver to own it — the app asserts it at boot.
+ */
+&spi3 {
+	pinctrl-0 = <&spi3_sck_pc10 &spi3_miso_pc11 &spi3_mosi_pc12>;
+	pinctrl-names = "default";
+	cs-gpios = <&gpiod 2 GPIO_ACTIVE_LOW>;
+	/*
+	 * Take the kernel clock from CKPER (HSI) instead of the SoC default
+	 * PLL1_Q, which does not run in build 1. The APB1 gate entry is
+	 * unchanged; only the second cell differs from stm32h7.dtsi.
+	 */
+	clocks = <&rcc STM32_CLOCK(APB1, 15)>,
+		 <&rcc STM32_SRC_CKPER SPI123_SEL(4)>;
+	status = "okay";
+
+	/*
+	 * The switch is an SPI client (R5 pulls SPIQ down to select client
+	 * mode). 8 MHz against the part's 25 MHz ceiling; from CKPER = HSI
+	 * 64 MHz the SPI prescaler is a power of two, so this is 64/8 exactly.
+	 *
+	 * reset-gpios is declared but deliberately unused by default — see the
+	 * binding and CONFIG_WASP_KSZ8794_HW_RESET. R6/C32 (10k/10uF) already
+	 * hold RST# low for ~100 ms at power-on, far past the 10 ms tSR the
+	 * datasheet asks for.
+	 */
+	eth_switch: switch@0 {
+		compatible = "wasp,ksz8794";
+		reg = <0>;
+		spi-max-frequency = <DT_FREQ_M(8)>;
+		reset-gpios = <&gpiod 3 GPIO_ACTIVE_LOW>;
+		status = "okay";
+	};
+};
+
+/* RMII to the switch. Pinout is identical to the Nucleo-H723ZG; what differs
+ * is the absence of MDIO below.
+ */
+&mac {
+	pinctrl-0 = <&eth_ref_clk_pa1
+		     &eth_crs_dv_pa7
+		     &eth_rxd0_pc4
+		     &eth_rxd1_pc5
+		     &eth_tx_en_pg11
+		     &eth_txd0_pg13
+		     &eth_txd1_pb13>;
+	pinctrl-names = "default";
+	phy-connection-type = "rmii";
+	phy-handle = <&eth_phy>;
+	status = "okay";
+};
+
+/* Explicitly off: PA2/PC1 are not wired to anything on this board. Left here
+ * so nobody re-adds MDIO by pattern-matching against the Nucleo DTS.
+ */
+&mdio {
+	status = "disabled";
+};
+
+/* USB-C (J7) — CDC-ACM console and DFU. D- = PA11, D+ = PA12. */
+zephyr_udc0: &usbotg_hs {
+	pinctrl-0 = <&usb_otg_hs_dm_pa11 &usb_otg_hs_dp_pa12>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+/*
+ * 8 Mbyte quad PSRAM (U3, APS6404L-3SQR-SN class) for WASM linear memory.
+ *
+ * DISABLED, and not for want of wiring. Two reasons, both fixable later:
+ *
+ *   1. drivers/memc/Kconfig.stm32 gates MEMC_STM32_OSPI_PSRAM on
+ *      SOC_SERIES_STM32U5X, so the driver does not build for H7 on
+ *      Zephyr 4.4.1 at all. Enabling it needs that dependency relaxed and
+ *      the driver checked against the H7 OCTOSPI HAL.
+ *   2. The OSPI kernel clock defaults to PLL1_Q, and build 1 runs on HSI
+ *      with no PLL enabled. Moving to the 550 MHz block above gives
+ *      PLL1_Q = 137.5 MHz, which needs dividing down to <= 84 MHz.
+ *
+ * The values below are derived, not yet measured:
+ *   max-frequency  84 MHz, not 133 — the datasheet caps linear bursts that
+ *                  cross a 1 KB page boundary at 84 MHz, and memory-mapped
+ *                  access cannot avoid crossing them.
+ *   st,refresh     tCEM is 8 us; 8 us * 84 MHz = 672 clocks, so 600 leaves
+ *                  margin. This bounds transaction length: exceed tCEM and
+ *                  the part loses data with no error reported.
+ *   rbx            required, for the same page-crossing reason.
+ *   burst-length 3 = 1 KB wrap, matching the device page size.
+ */
+&octospi1 {
+	pinctrl-0 = <&octospim_p1_clk_pf10 &octospim_p1_ncs_pg6
+		     &octospim_p1_io0_pf8 &octospim_p1_io1_pf9
+		     &octospim_p1_io2_pf7 &octospim_p1_io3_pf6>;
+	pinctrl-names = "default";
+	status = "disabled";
+
+	psram: memory@0 {
+		compatible = "st,stm32-ospi-psram";
+		reg = <0>;
+		size = <DT_SIZE_M(64)>;		/* 64 Mbit = 8 Mbyte */
+		max-frequency = <DT_FREQ_M(84)>;
+		rbx;
+		burst-length = <3>;
+		st,csbound = <10>;
+		st,refresh = <600>;
+		status = "disabled";
+	};
+};
+
+/* Expansion headers J8/J9. */
+&i2c2 {
+	pinctrl-0 = <&i2c2_sda_pf0 &i2c2_scl_pf1>;
+	pinctrl-names = "default";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	status = "okay";
+};
+
+&spi2 {
+	pinctrl-0 = <&spi2_sck_pb10 &spi2_miso_pb14 &spi2_mosi_pb15>;
+	pinctrl-names = "default";
+	/*
+	 * Same reparenting as &spi3, and not optional: SPI123SEL is a single
+	 * RCC field shared by SPI1/2/3, so all enabled instances must name the
+	 * same source. Left on the default PLL1_Q, spi_stm32_init() fails the
+	 * domain-clock select and returns, so SPI2 never initialises.
+	 */
+	clocks = <&rcc STM32_CLOCK(APB1, 14)>,
+		 <&rcc STM32_SRC_CKPER SPI123_SEL(4)>;
+	cs-gpios = <&gpiob 12 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+	status = "okay";
+};
+
+&fdcan1 {
+	pinctrl-0 = <&fdcan1_rx_pd0 &fdcan1_tx_pd1>;
+	pinctrl-names = "default";
+	/*
+	 * Nucleo clocks FDCAN from PLL2_Q. No PLL runs in build 1, so take
+	 * the kernel clock from HSE... which is also off. Leave FDCAN's
+	 * domain clock at the SoC default and enable the peripheral only
+	 * once a PLL exists; CAN is a header convenience, not on the
+	 * bring-up path.
+	 */
+	status = "disabled";
+};
+
+&rng {
+	status = "okay";
+};

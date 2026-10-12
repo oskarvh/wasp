@@ -11,6 +11,13 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/wifi_credentials.conf)
   list(APPEND EXTRA_CONF_FILE ${CMAKE_CURRENT_SOURCE_DIR}/wifi_credentials.conf)
 endif()
 
+# Out-of-tree board definitions live at the repo root: boards/wasp/wasp_node.
+# Both roots have to be set before find_package(Zephyr); DTS_ROOT is what
+# makes dts/bindings/vendor-prefixes.txt visible so "wasp,..." compatibles
+# are not flagged as an unknown vendor.
+list(APPEND BOARD_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
+list(APPEND DTS_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(wasp LANGUAGES C)
 
@@ -18,6 +25,9 @@ target_sources(app PRIVATE
   src/main.c
   src/led.c
   src/net/netup.c
+  # Self-guards on the eth_switch devicetree node, so it compiles to nothing
+  # on boards without a KSZ8794 (the Nucleos, the Picos).
+  src/net/ksz8794.c
 )
 
 # Worker role: WAMR runtime, agent/executor threads, listening socket.

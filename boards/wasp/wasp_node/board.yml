@@ -1,0 +1,6 @@
+board:
+  name: wasp_node
+  full_name: wasp node board (rev V1)
+  vendor: wasp
+  socs:
+    - name: stm32h723xx
