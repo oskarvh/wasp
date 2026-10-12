@@ -97,8 +97,36 @@ int wasp_queue_error(const struct wasp_msg *req, uint8_t err, const char *detail
 
 #endif /* CONFIG_WASP_WORKER */
 
+/*
+ * Report the clock tree the SoC actually ended up with, not the one the
+ * devicetree asked for. On the wasp node board these differ in an
+ * interesting way: HSE is bypass-fed from the Ethernet switch's REFCLKO,
+ * so "did the PLL lock onto a real 25 MHz?" is a board-level question,
+ * and the answer is otherwise invisible — a silent fallback and a correct
+ * boot look identical from the console.
+ */
+#if defined(CONFIG_SOC_FAMILY_STM32)
+#include <stm32_ll_rcc.h>
+
+static void log_clock_tree(void)
+{
+	static const char *const src[] = { "HSI", "CSI", "HSE", "PLL1" };
+	uint32_t sws = LL_RCC_GetSysClkSource() >> RCC_CFGR_SWS_Pos;
+
+	LOG_INF("sysclk %u MHz from %s (HSE %s, PLL1 %s), HCLK %u MHz",
+		HAL_RCC_GetSysClockFreq() / 1000000U,
+		src[sws & 0x3],
+		LL_RCC_HSE_IsReady() ? "ready" : "off",
+		LL_RCC_PLL1_IsReady() ? "locked" : "off",
+		HAL_RCC_GetHCLKFreq() / 1000000U);
+}
+#else
+static void log_clock_tree(void) { }
+#endif
+
 int main(void)
 {
 	LOG_INF("wasp node booting (board: %s)", CONFIG_BOARD);
+	log_clock_tree();
 	return 0;
 }

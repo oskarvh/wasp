@@ -11,7 +11,7 @@
  *
  *   1. The RMII side is wired MAC-to-MAC into a switch — no PHY, no MDIO.
  *   2. HSE is bypass-fed from that switch's REFCLK0, so the clock tree
- *      depends on the switch. Build 1 therefore runs from HSI.
+ *      depends on the switch coming up first.
  *   3. There is a PSRAM on OCTOSPI1 for WASM linear memory.
  */
 
@@ -66,60 +66,38 @@
 };
 
 /*
- * Build 1 runs from HSI at 64 MHz, on purpose.
+ * Clock tree: HSE 25 MHz bypass -> PLL1 -> 550 MHz SYSCLK.
  *
- * HSE on this board is bypass-fed from the KSZ8794's REFCLK0 through R26
- * (R25 selects a DNP oscillator instead). Enabling HSE therefore makes the
- * MCU's entire clock tree depend on the switch having come up first — and if
- * REFCLK0 is not running, the HSE-ready poll in SystemClock_Config spins
- * before any application code executes. The symptom is a board that takes
- * SWD but never prints, with nothing on the console to say why.
+ * HSE here is not a crystal. It is bypass-fed from the KSZ8794's REFCLKO
+ * through R26 (R25 selects a DNP oscillator instead), so the MCU's entire
+ * clock tree depends on the switch having come up. If REFCLKO were not
+ * running, the HSE-ready poll inside SystemClock_Config would spin before
+ * any application code executes, and the board would take SWD but never
+ * print a character. That risk is why bring-up ran on HSI first; REFCLKO
+ * is now confirmed good, since Ethernet works and the RMII 50 MHz on PA1
+ * comes out of the same chip.
  *
- * So: prove power, flash, SWD, GPIO, console and Ethernet on HSI, confirm
- * REFCLK0 with a scope on PH0 (or just watch Ethernet work, since the RMII
- * 50 MHz on PA1 comes from the same switch), then switch to the block below.
+ * Two things must not be undone here:
  *
- * To move to 550 MHz, delete this &clk_hsi/&rcc pair and use:
+ *   - &clk_hsi stays enabled. CKPER feeds SPI2/SPI3's kernel clock (see
+ *     &perck and &spi3), and SPI3 is what puts the switch's port 4 into
+ *     RMII — which is what makes HSE itself arrive. Disabling HSI breaks
+ *     Ethernet, and after the next reset it breaks the clock tree.
+ *   - Never assert the switch's RST# while running from HSE: it would
+ *     stop the clock the CPU is executing from. That is why
+ *     CONFIG_WASP_KSZ8794_HW_RESET defaults to n.
  *
- *	&clk_hse {
- *		hse-bypass;			// PH0 driven, PH1 unconnected
- *		clock-frequency = <DT_FREQ_M(25)>;
- *		status = "okay";
- *	};
- *
- *	&pll {
- *		div-m = <5>;			// 25 / 5   = 5 MHz ref  (1-16 MHz OK)
- *		mul-n = <110>;			//  5 * 110 = 550 MHz VCO (wide range)
- *		div-p = <1>;			// SYSCLK   = 550 MHz
- *		div-q = <4>;			//           137.5 MHz
- *		div-r = <2>;			//           275   MHz
- *		clocks = <&clk_hse>;
- *		status = "okay";
- *	};
- *
- *	&rcc {
- *		clocks = <&pll>;
- *		clock-frequency = <DT_FREQ_M(550)>;
- *		d1cpre = <1>;
- *		hpre = <2>;			// HCLK 275   MHz
- *		d1ppre = <2>;			// APB3 137.5 MHz
- *		d2ppre1 = <2>;			// APB1 137.5 MHz
- *		d2ppre2 = <2>;			// APB2 137.5 MHz
- *		d3ppre = <2>;			// APB4 137.5 MHz
- *	};
- *
- * Two things must survive that move, or Ethernet breaks again:
- *
- *   - Keep &clk_hsi enabled, or repoint &perck. CKPER feeds SPI2/SPI3's
- *     kernel clock (see &spi3), and the switch's management bus is what
- *     puts port 4 into RMII in the first place. Alternatively hand SPI123
- *     back to PLL1_Q, which does exist once the block above is live.
- *   - Never assert the switch's RST#. HSE is bypass-fed from the same
- *     chip's REFCLKO through R26, so resetting the switch while the CPU
- *     runs on an HSE-derived PLL stops the clock the CPU is executing
- *     from. CONFIG_WASP_KSZ8794_HW_RESET is off by default for this
- *     reason and must stay off here.
+ * To fall back to the HSI-only bring-up tree, set &clk_hse and &pll to
+ * "disabled" and point &rcc at <&clk_hsi> with clock-frequency 64 MHz and
+ * every prescaler at 1.
  */
+&clk_hse {
+	hse-bypass;			/* PH0 driven from REFCLKO, PH1 unused */
+	clock-frequency = <DT_FREQ_M(25)>;
+	status = "okay";
+};
+
+/* Kept on for CKPER -> SPI123, not for the system clock. */
 &clk_hsi {
 	status = "okay";
 };
@@ -129,22 +107,36 @@
 	status = "okay";
 };
 
+&pll {
+	div-m = <5>;			/* 25 / 5   =   5   MHz ref (1-16 MHz) */
+	mul-n = <110>;			/*  5 * 110 = 550   MHz VCO (wide range) */
+	div-p = <1>;			/* SYSCLK    = 550   MHz */
+	div-q = <4>;			/* PLL1_Q    = 137.5 MHz -> OCTOSPI */
+	div-r = <2>;			/* PLL1_R    = 275   MHz */
+	clocks = <&clk_hse>;
+	status = "okay";
+};
+
 &rcc {
-	clocks = <&clk_hsi>;
-	clock-frequency = <DT_FREQ_M(64)>;
+	clocks = <&pll>;
+	clock-frequency = <DT_FREQ_M(550)>;
 	d1cpre = <1>;
-	hpre = <1>;	/* HCLK 64 MHz — above the 25 MHz the ETH DMA needs */
-	d1ppre = <1>;
-	d2ppre1 = <1>;
-	d2ppre2 = <1>;
-	d3ppre = <1>;
+	hpre = <2>;	/* HCLK 275   MHz */
+	d1ppre = <2>;	/* APB3 137.5 MHz */
+	d2ppre1 = <2>;	/* APB1 137.5 MHz */
+	d2ppre2 = <2>;	/* APB2 137.5 MHz */
+	d3ppre = <2>;	/* APB4 137.5 MHz */
 };
 
 /*
- * CKPER = HSI. This exists purely so SPI3 has a kernel clock: SPI1/2/3 on
- * the H7 all default to PLL1_Q, and build 1 runs no PLL at all, so without
- * this the switch's management bus is clocked from a stopped PLL and every
- * transfer times out.
+ * CKPER = HSI, feeding SPI2/SPI3 (see &spi3).
+ *
+ * PLL1_Q now exists and would do, but it is 137.5 MHz: the SPI prescaler
+ * is a power of two, so the slowest it could run the switch's bus is
+ * 137.5/256 and the useful settings land either side of the part's 25 MHz
+ * ceiling. HSI 64 MHz divides to exactly 8 MHz. Keeping CKPER also means
+ * the management bus is independent of the PLL, which matters because the
+ * PLL's own reference arrives through that switch.
  */
 &perck {
 	clocks = <&rcc STM32_SRC_HSI_KER CKPER_SEL(0)>;

@@ -94,7 +94,7 @@ LOG_MODULE_REGISTER(wasp_ksz, LOG_LEVEL_INF);
 #define IF_CTRL6_RMII_CLK   BIT(7) /* 1 = clock mode: switch drives RXC4 */
 
 static const struct spi_dt_spec bus =
-	SPI_DT_SPEC_GET(SWITCH_NODE, SPI_WORD_SET(8) | SPI_TRANSFER_MSB, 0);
+	SPI_DT_SPEC_GET(SWITCH_NODE, SPI_WORD_SET(8) | SPI_TRANSFER_MSB);
 
 static int ksz_read(uint8_t addr, uint8_t *val)
 {
@@ -294,7 +294,7 @@ static int ksz8794_configure(void)
 
 			if (ksz_read(REG_GLOBAL_CTRL5, &lo) == 0) {
 				LOG_INF("storm protect on ports 1-3, rate 0x%03x",
-					((gc4 & GC4_STORM_RATE_HI) << 8) | lo);
+					(unsigned int)(((gc4 & GC4_STORM_RATE_HI) << 8) | lo));
 			}
 		}
 	}
