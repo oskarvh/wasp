@@ -200,10 +200,89 @@ class WaspNode:
         self.regions: dict[int, bytearray] = {}
         self.locks: dict[int, tuple[str, float]] = {}
         self.lock_queue: dict[int, list[str]] = {}
+        # Pipelining state. Several requests may be in flight at once, so
+        # responses can arrive in any order: _outstanding is what we are
+        # still owed, _pending what has arrived but not been collected.
+        self._outstanding: set[int] = set()
+        self._pending: dict[int, tuple[int, bytes]] = {}
+        # Node-initiated requests held back instead of answered. Setting
+        # defer_node_reqs parks whichever instance issued them, which is
+        # how a test pins one instance mid-call while another runs.
+        self.defer_node_reqs = False
+        self._deferred: list[tuple[int, int, bytes]] = []
 
     def register_region(self, region_id: int, buf: bytearray):
         """Export buf to the node as remote memory region region_id."""
         self.regions[region_id] = buf
+
+    # -- pipelining ----------------------------------------------------
+
+    def send(self, msg_type: int, payload: bytes = b"") -> int:
+        """Send one frame without waiting; returns its seq.
+
+        Use with collect(). Several requests may be outstanding, which is
+        the only way to observe a node running one instance while another
+        is blocked — a send-and-wait client can never have two calls in
+        flight to see it.
+        """
+        seq = self.seq = (self.seq + 1) & 0xFF
+        self._outstanding.add(seq)
+        self.sock.sendall(HDR.pack(MAGIC, msg_type, seq, len(payload)) + payload)
+        return seq
+
+    def _pump(self, deadline: float | None) -> bool:
+        """Read one frame. Returns False if nothing arrived before deadline."""
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            self.sock.settimeout(left)
+        try:
+            rtype, rseq, rpayload = self._recv_frame()
+        except socket.timeout:
+            return False
+
+        if rtype in NODE_REQUESTS:
+            if self.defer_node_reqs:
+                self._deferred.append((rtype, rseq, rpayload))
+            else:
+                self._serve_node_req(rtype, rseq, rpayload)
+            return True
+
+        if rseq not in self._outstanding:
+            raise ValueError(
+                f"response seq {rseq} (type 0x{rtype:02x}) was not requested "
+                f"— stale or corrupt stream")
+        self._outstanding.discard(rseq)
+        self._pending[rseq] = (rtype, rpayload)
+        return True
+
+    def collect(self, seq: int, timeout: float = 10.0) -> tuple[int, int, bytes]:
+        """Wait for the response to a seq returned by send()."""
+        deadline = time.monotonic() + timeout
+        while seq not in self._pending:
+            if not self._pump(deadline):
+                raise TimeoutError(f"no response to seq {seq} within {timeout}s")
+        rtype, rpayload = self._pending.pop(seq)
+        return rtype, seq, rpayload
+
+    def wait_node_request(self, timeout: float = 5.0):
+        """Wait for the node to issue a request, with defer_node_reqs set.
+
+        Returns it without answering, so the instance that issued it stays
+        blocked until serve_deferred().
+        """
+        deadline = time.monotonic() + timeout
+        while not self._deferred:
+            if not self._pump(deadline):
+                return None
+        return self._deferred[-1]
+
+    def serve_deferred(self):
+        """Answer everything held back, releasing the blocked instances."""
+        held, self._deferred = self._deferred, []
+        for rtype, rseq, rpayload in held:
+            self._serve_node_req(rtype, rseq, rpayload)
 
     def request(self, msg_type: int, payload: bytes = b"") -> tuple[int, int, bytes]:
         """Send one frame and return the (type, seq, payload) response.
@@ -211,18 +290,7 @@ class WaspNode:
         Node-initiated remote-memory requests arriving while we wait are
         serviced inline — the node issues them mid-CALL.
         """
-        seq = self.seq = (self.seq + 1) & 0xFF
-        self.sock.sendall(HDR.pack(MAGIC, msg_type, seq, len(payload)) + payload)
-        while True:
-            rtype, rseq, rpayload = self._recv_frame()
-            if rtype in NODE_REQUESTS:
-                self._serve_node_req(rtype, rseq, rpayload)
-                continue
-            if rseq != seq:
-                raise ValueError(
-                    f"response seq {rseq} does not match request seq {seq} "
-                    f"(type 0x{rtype:02x}) — stale or corrupt stream")
-            return rtype, rseq, rpayload
+        return self.collect(self.send(msg_type, payload))
 
     # -- remote memory host (the coordinator side of wasp.*) ----------
 
@@ -715,6 +783,94 @@ def cmd_instances(node: WaspNode, args):
     print("all multi-instance checks passed")
 
 
+def cmd_concurrency(node: WaspNode, args):
+    """Prove one instance runs while another is blocked on the network.
+
+    The node has a pool of executor threads, so a call parked waiting for
+    a remote-memory round trip should not stop another instance running.
+    That is unobservable from a send-and-wait client, and a timing-based
+    test of it would be a coin toss, so this pins the blocked instance
+    deterministically: the coordinator withholds the MEM_DATA that
+    instance A is waiting for, and instance B has to complete anyway.
+    """
+    remote_wasm = open(args.module, "rb").read()
+    compute_wasm = open(args.module2, "rb").read()
+
+    _, _, features = node.hello()
+    check("node advertises MULTI_INSTANCE", bool(features & FEAT_MULTI_INSTANCE))
+    check("node advertises remote memory", bool(features & FEAT_REMOTE_MEM))
+
+    inv = node.inventory()
+    if inv["slots_free"] < 2:
+        check("node has two free instance slots", False,
+              f"only {inv['slots_free']}")
+
+    mod_a, (inst_a,) = node.upload(remote_wasm, 1)
+    mod_b, (inst_b,) = node.upload(compute_wasm, 1)
+    check("two different programs resident", mod_a != mod_b,
+          f"instance {inst_a} (remote) and {inst_b} (compute)")
+
+    region = bytearray(struct.pack("<16i", *range(16)))
+    node.register_region(1, region)
+    ref = pack_ref(1)
+
+    # Park A: sum_region reads the region one element at a time, so the
+    # first MEM_READ blocks it inside wasm_runtime_call_wasm.
+    node.defer_node_reqs = True
+    seq_a = node.send(CALL_INST,
+                      bytes([inst_a]) + WaspNode._call_payload("sum_region", (ref, 16)))
+    held = node.wait_node_request(timeout=5.0)
+    check("instance A is blocked on a remote read",
+          held is not None and held[0] == MEM_READ,
+          "MEM_READ withheld by the coordinator")
+
+    # The whole point: B executes while A sits on the network.
+    t0 = time.monotonic()
+    res_b = node.call_inst(inst_b, "add", 20, 22)
+    b_ms = (time.monotonic() - t0) * 1000
+    check("instance B runs to completion while A is blocked",
+          res_b == [42], f"add(20,22) = {res_b[0]} in {b_ms:.1f} ms")
+
+    # And B is not merely queued behind A: A is still blocked.
+    check("A is still blocked, so B did not wait for it",
+          seq_a not in node._pending and not node._outstanding - {seq_a})
+
+    # Several calls to B while A stays parked, to show the executor pool
+    # is genuinely free rather than briefly stealing a turn.
+    fib = node.call_inst(inst_b, "fib", 20)
+    check("B keeps serving with A still blocked", fib == [6765],
+          f"fib(20) = {fib[0]}")
+
+    # A second call into A itself must be refused, not serialised: one
+    # wasm_module_inst_t is not re-entrant.
+    t, _, resp = node.collect(
+        node.send(CALL_INST,
+                  bytes([inst_a]) + WaspNode._call_payload("region_len", (1,))))
+    check("a second call to the busy instance -> BUSY",
+          t == ERROR and bool(resp) and ERR_NAMES.get(resp[0]) == "BUSY",
+          err_name(resp))
+
+    # Release A and let it finish its 16 reads.
+    node.defer_node_reqs = False
+    node.serve_deferred()
+    t, _, resp = node.collect(seq_a, timeout=15.0)
+    check("A completes once the coordinator answers",
+          t == RESULT and WaspNode._call_result("sum_region", t, resp) == [120],
+          "sum_region = 120")
+
+    # Both instances still usable afterwards.
+    check("A is callable again", node.call_inst(inst_a, "region_len", 1) == [64])
+    check("B is unaffected", node.call_inst(inst_b, "add", 1, 1) == [2])
+
+    node.drop_module(mod_a)
+    node.drop_module(mod_b)
+    inv = node.inventory()
+    check("everything released", not inv["modules"],
+          f"{inv['slots_free']}/{inv['slots_total']} slots free")
+
+    print("all concurrency checks passed")
+
+
 def cmd_load(node: WaspNode, args):
     node.hello()
     node.load(open(args.module, "rb").read())
@@ -801,6 +957,10 @@ def main():
     p = sub.add_parser("remote2", help="transparent remote pointer self-test")
     p.add_argument("as_module", help="path to remote_as_module.wasm")
     p.add_argument("cpp_module", help="path to remote_cpp_module.wasm")
+    p = sub.add_parser("concurrency",
+                       help="prove instances run while others block on the network")
+    p.add_argument("module", help="remote_module.wasm (does remote reads)")
+    p.add_argument("module2", help="test_module.wasm (pure compute)")
     p = sub.add_parser("instances", help="multi-instance self-test")
     p.add_argument("module", help=".wasm exporting add(i32,i32)")
     p.add_argument("module2", nargs="?", help="a second, different .wasm")
@@ -823,6 +983,7 @@ def main():
 
     handlers = {"check": cmd_check, "lifecycle": cmd_lifecycle, "remote": cmd_remote,
                 "remote2": cmd_remote2, "instances": cmd_instances,
+                "concurrency": cmd_concurrency,
                 "load": cmd_load, "unload": cmd_unload,
                 "call": cmd_call, "identify": cmd_identify, "reboot": cmd_reboot,
                 None: cmd_check}
