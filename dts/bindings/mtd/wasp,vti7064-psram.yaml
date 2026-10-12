@@ -1,0 +1,51 @@
+# Copyright (c) 2026 Oskar von Heideken
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Vilsion VTI7064 64 Mbit quad SPI/QPI PSRAM on an STM32 OCTOSPI, mapped
+  into the address space for both read and write.
+
+  Zephyr's st,stm32-ospi-psram driver cannot drive this part: it is an
+  octal (8-line) HyperRAM/Xccela driver for AP Memory APS256XX-class
+  devices, with 8-line instruction, address and data phases and
+  MEMTYPE_APMEMORY. This is a 4-line SOIC-8 part with the APS6404L-style
+  command set, so it gets its own driver.
+
+compatible: "wasp,vti7064-psram"
+
+include: [base.yaml]
+
+properties:
+  reg:
+    required: true
+
+  size:
+    type: int
+    required: true
+    description: Density in bits.
+
+  max-frequency:
+    type: int
+    required: true
+    description: |
+      Maximum OCTOSPI clock in Hz. The driver picks the fastest integer
+      prescaler of the OSPI kernel clock that does not exceed this, and
+      logs what it achieved.
+
+  wasp,tcem-ns:
+    type: int
+    required: true
+    description: |
+      tCEM: the longest the device tolerates chip select held low, in ns.
+      Exceeding it blocks the internal refresh and the array loses data
+      with nothing reported, so the driver converts this into OCTOSPI's
+      DCR4 refresh counter against the clock it actually achieved rather
+      than trusting a hand-computed cycle count.
+
+  st,csbound:
+    type: int
+    default: 10
+    description: |
+      Release chip select on a 2^n byte boundary. Defaults to the 1 Kbyte
+      page size, which keeps a memory-mapped burst from straddling two
+      pages.

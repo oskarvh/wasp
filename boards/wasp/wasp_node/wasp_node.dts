@@ -239,45 +239,75 @@ zephyr_udc0: &usbotg_hs {
 };
 
 /*
- * 8 Mbyte quad PSRAM (U3, APS6404L-3SQR-SN class) for WASM linear memory.
+ * The MPU has to be told the external window is real memory.
  *
- * DISABLED, and not for want of wiring. Two reasons, both fixable later:
+ * stm32h7.dtsi declares memory@90000000 as 256 MB with
+ * zephyr,memory-attr = ATTR_MPU_EXTMEM, and on ARMv7-M that maps to
+ * REGION_EXTMEM_ATTR = STRONGLY_ORDERED_SHAREABLE | NO_ACCESS. A sensible
+ * SoC-level default, since nothing is out there until a board wires
+ * something up — but with the PSRAM mapped and that region left alone,
+ * the first store to 0x90000000 takes an MPU data access violation, which
+ * is exactly what happened the first time this ran.
  *
- *   1. drivers/memc/Kconfig.stm32 gates MEMC_STM32_OSPI_PSRAM on
- *      SOC_SERIES_STM32U5X, so the driver does not build for H7 on
- *      Zephyr 4.4.1 at all. Enabling it needs that dependency relaxed and
- *      the driver checked against the H7 OCTOSPI HAL.
- *   2. The OSPI kernel clock defaults to PLL1_Q, and build 1 runs on HSI
- *      with no PLL enabled. Moving to the 550 MHz block above gives
- *      PLL1_Q = 137.5 MHz, which needs dividing down to <= 84 MHz.
+ * ATTR_MPU_RAM instead gives normal write-back write-allocate memory with
+ * privileged read/write, so the PSRAM is cached (worth a lot, since WASM
+ * linear memory is touched only by the CPU and never by DMA) rather than
+ * strongly ordered.
  *
- * The values below are derived, not yet measured:
- *   max-frequency  84 MHz, not 133 — the datasheet caps linear bursts that
- *                  cross a 1 KB page boundary at 84 MHz, and memory-mapped
- *                  access cannot avoid crossing them.
- *   st,refresh     tCEM is 8 us; 8 us * 84 MHz = 672 clocks, so 600 leaves
- *                  margin. This bounds transaction length: exceed tCEM and
- *                  the part loses data with no error reported.
- *   rbx            required, for the same page-crossing reason.
- *   burst-length 3 = 1 KB wrap, matching the device page size.
+ * The size shrinks from the architectural 256 MB to the 8 MB actually
+ * fitted, so an access past the end of the device faults instead of
+ * quietly aliasing back into the array. 0x90000000 is 8 MB aligned, which
+ * ARMv7-M requires of a power-of-two region.
+ */
+&ext_memory {
+	reg = <0x90000000 DT_SIZE_M(8)>;
+	zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_RAM)>;
+};
+
+/*
+ * 8 Mbyte quad PSRAM (U3) for WASM linear memory, memory-mapped at
+ * 0x90000000 for both reads and writes.
+ *
+ * The mounted part is a Vilsion VTI7064MSME, not the APS6404L the board
+ * was originally drawn around. They share pinout, package, density and
+ * command set, but not timing, and one difference matters: tCEM is 4 us
+ * on this part against the APS6404L's 8 us. tCEM bounds how long chip
+ * select may stay low; overrun it and the internal refresh is blocked and
+ * the array quietly loses data with nothing reported. So tCEM is declared
+ * here in nanoseconds and the driver converts it against the clock it
+ * actually achieved, rather than carrying a precomputed cycle count that
+ * would silently become wrong if the clock changed.
+ *
+ * Zephyr's own st,stm32-ospi-psram driver is not usable here. It is an
+ * octal HyperRAM/Xccela driver for AP Memory APS256XX-class parts — 8-line
+ * instruction, address and data, MEMTYPE_APMEMORY, APS256XX mode
+ * registers. (Its Kconfig also gates on SOC_SERIES_STM32U5X, but that
+ * gate was never the real obstacle.) This is a 4-line SOIC-8 part, so it
+ * has its own driver in app/src/mem/psram.c.
+ *
+ * On the clock: the data sheet is Rev 0.1 "Preliminary" and contradicts
+ * itself. Its feature list claims "20 MHz Clock rate for all mode", while
+ * its AC characteristics table gives 33 MHz for the 0x03 read, 84 MHz for
+ * 0x0B and 104 MHz for everything else including the 0xEB quad read used
+ * here. 68.75 MHz (PLL1_Q 137.5 / 2) sits under the table's limit with
+ * margin; the driver's self-test is what decides whether the table or the
+ * feature list is telling the truth.
  */
 &octospi1 {
 	pinctrl-0 = <&octospim_p1_clk_pf10 &octospim_p1_ncs_pg6
 		     &octospim_p1_io0_pf8 &octospim_p1_io1_pf9
 		     &octospim_p1_io2_pf7 &octospim_p1_io3_pf6>;
 	pinctrl-names = "default";
-	status = "disabled";
+	status = "okay";
 
-	psram: memory@0 {
-		compatible = "st,stm32-ospi-psram";
+	psram: psram@0 {
+		compatible = "wasp,vti7064-psram";
 		reg = <0>;
 		size = <DT_SIZE_M(64)>;		/* 64 Mbit = 8 Mbyte */
-		max-frequency = <DT_FREQ_M(84)>;
-		rbx;
-		burst-length = <3>;
-		st,csbound = <10>;
-		st,refresh = <600>;
-		status = "disabled";
+		max-frequency = <DT_FREQ_M(69)>;	/* -> 137.5/2 = 68.75 MHz */
+		wasp,tcem-ns = <4000>;		/* AC table: tCEM max 4 us */
+		st,csbound = <10>;		/* 1 Kbyte page */
+		status = "okay";
 	};
 };
 

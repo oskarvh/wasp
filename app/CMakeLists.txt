@@ -28,6 +28,8 @@ target_sources(app PRIVATE
   # Self-guards on the eth_switch devicetree node, so it compiles to nothing
   # on boards without a KSZ8794 (the Nucleos, the Picos).
   src/net/ksz8794.c
+  # Likewise guards on the psram node.
+  src/mem/psram.c
 )
 
 # Worker role: WAMR runtime, agent/executor threads, listening socket.

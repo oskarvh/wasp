@@ -105,7 +105,7 @@ int wasp_queue_error(const struct wasp_msg *req, uint8_t err, const char *detail
  * and the answer is otherwise invisible — a silent fallback and a correct
  * boot look identical from the console.
  */
-#if defined(CONFIG_SOC_FAMILY_STM32)
+#if defined(CONFIG_SOC_SERIES_STM32H7X)
 #include <stm32_ll_rcc.h>
 
 static void log_clock_tree(void)
@@ -118,6 +118,18 @@ static void log_clock_tree(void)
 		src[sws & 0x3],
 		LL_RCC_HSE_IsReady() ? "ready" : "off",
 		LL_RCC_PLL1_IsReady() ? "locked" : "off",
+		HAL_RCC_GetHCLKFreq() / 1000000U);
+}
+#elif defined(CONFIG_SOC_FAMILY_STM32)
+static void log_clock_tree(void)
+{
+	/* The per-series LL names for the PLL and HSE ready flags differ
+	 * (LL_RCC_PLL_IsReady on F4 against LL_RCC_PLL1_IsReady on H7), and
+	 * the detail above only earns its keep on a board whose HSE comes
+	 * from another chip on the PCB. Elsewhere the rates are enough.
+	 */
+	LOG_INF("sysclk %u MHz, HCLK %u MHz",
+		HAL_RCC_GetSysClockFreq() / 1000000U,
 		HAL_RCC_GetHCLKFreq() / 1000000U);
 }
 #else

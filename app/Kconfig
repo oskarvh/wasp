@@ -161,6 +161,30 @@ config WASP_CONDUCTOR_CHAOS
 	  lost tiles to the survivors at the end — the firmware version
 	  of the Python demo's --chaos flag.
 
+config WASP_PSRAM
+	bool
+	default y
+	depends on DT_HAS_WASP_VTI7064_PSRAM_ENABLED
+	select USE_STM32_HAL_OSPI
+	select PINCTRL
+	help
+	  Hidden. Pulls in the OSPI HAL and pinctrl for app/src/mem/psram.c
+	  whenever a board's devicetree has the PSRAM node enabled.
+
+config WASP_PSRAM_SELFTEST
+	bool "Sweep the external PSRAM at boot"
+	default y
+	depends on WASP_PSRAM
+	help
+	  Writes and verifies the whole array three times over: once with
+	  each word holding its own address, once with 0x55/0xAA, and once
+	  through byte and halfword accesses. Costs a second or two of boot
+	  time and reports throughput.
+
+	  The full sweep is the point. The mapped window is cacheable and the
+	  H7's D-cache is on, so a short test would be served from cache and
+	  would pass against a dead device.
+
 config WASP_KSZ8794_STORM_PROTECT
 	bool "Enable broadcast storm protection on the switch's external ports"
 	default y
