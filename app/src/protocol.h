@@ -18,6 +18,45 @@
  *   UNLOAD_MODULE (c->n): empty; success ack is an empty RESULT
  *   CALL       (c->n): [name_len u8][name][argc u8][arg u32 LE × argc]
  *                      v1 calling convention: i32 args/results only
+ *
+ * The three above address "the" module, of which there is one. They are
+ * kept exactly as they were and are now sugar for the default instance,
+ * so every existing client keeps working untouched. Nodes that can host
+ * more than one module advertise WASP_FEAT_MULTI_INSTANCE and also accept:
+ *
+ *   MODULE_UPLOAD (c->n): [n_inst u8][.wasm binary]
+ *                 (n->c): RESULT [mod u8][n u8][inst u8 × n]
+ *   INSTANTIATE   (c->n): [mod u8][count u8]
+ *                 (n->c): RESULT [count u8][inst u8 × count]
+ *   CALL_INST     (c->n): [inst u8][name_len u8][name][argc u8][arg u32 × argc]
+ *                 (n->c): RESULT, as CALL
+ *   DROP          (c->n): [kind u8][handle u8]
+ *                         kind 0 = instance, 1 = module (and its instances)
+ *                 (n->c): RESULT, empty
+ *   INVENTORY     (c->n): empty
+ *                 (n->c): RESULT [slots_total u8][slots_free u8]
+ *                         [pool_free u32 LE][n_mod u8]
+ *                         [{mod u8, n_inst u8, inst u8 × n_inst} × n_mod]
+ *
+ * The split is WAMR's own: a *module* is validated bytecode
+ * (wasm_module_t), an *instance* is an instantiation of it with its own
+ * linear memory (wasm_module_inst_t). Separating them is what lets the
+ * same bytecode back several instances and different bytecode run side by
+ * side, and it is why MODULE_UPLOAD carries a count: n_inst = 3 sends the
+ * binary once and returns three instance handles in one round trip, while
+ * n_inst = 0 uploads without instantiating. INSTANTIATE adds instances to
+ * bytecode the node already holds, with nothing re-sent. Instances are
+ * independent — nothing ties a node's instances to one program.
+ *
+ * Handles are (gen:4 | idx:4). The generation is not decoration: without
+ * it, dropping instance 1 and instantiating into the freed slot would make
+ * a stale CALL_INST execute against whatever now lives there. Reusing a
+ * retired handle answers ERROR(BAD_HANDLE) instead.
+ *
+ * Only one call runs per instance at a time (a second concurrent CALL_INST
+ * on the same instance answers ERROR(BUSY)); calls to *different*
+ * instances do run concurrently, which is the point — an instance parked
+ * on a remote-memory round trip is not holding up the others.
  *   RESULT     (n->c): [nresults u8][value u32 LE × nresults]
  *   ERROR      (n->c): [error code u8 (enum wasp_err)][utf8 detail, optional]
  *   PING       (c->n): arbitrary; PONG echoes it back
@@ -33,6 +72,17 @@
  *
  *   ['W']['A'][ANNOUNCE u8][version u8][features u8][tcp port u16 LE]
  *   [busy u8: coordinator currently connected][board_len u8][board name]
+ *   [slots_total u8][slots_free u8][pool_free u32 LE]
+ *
+ * The three capacity fields come after the board name precisely so that
+ * they are optional: a reader that stops at the end of the name sees the
+ * v1 datagram, which is how existing clients keep working. They matter
+ * because `busy` is now too coarse — a node with three slots and one in
+ * use is not busy — and because the WAMR pool is sized at boot from
+ * whatever RAM the board has left over, so capacity is a property of the
+ * node rather than of the firmware. A coordinator can see that one node
+ * has room for three instances and another for one without connecting to
+ * either.
  *
  * Remote memory (feature bit WASP_FEAT_REMOTE_MEM): the 0x4x range is
  * node-initiated — sent by the node mid-CALL, answered by the
@@ -96,6 +146,13 @@ enum wasp_msg_type {
 	WASP_MSG_REBOOT = 0x0B,   /* reboot the node (optionally into its bootloader) */
 	WASP_MSG_ANNOUNCE = 0x0C, /* UDP broadcast datagram, never on the TCP stream */
 
+	/* Multi-instance API (WASP_FEAT_MULTI_INSTANCE). */
+	WASP_MSG_MODULE_UPLOAD = 0x0D,
+	WASP_MSG_INSTANTIATE = 0x0E,
+	WASP_MSG_CALL_INST = 0x0F,
+	WASP_MSG_DROP = 0x10,
+	WASP_MSG_INVENTORY = 0x11,
+
 	/* 0x4x: node-initiated remote-memory traffic (node's seq space). */
 	WASP_MSG_MEM_READ = 0x40,
 	WASP_MSG_MEM_DATA = 0x41,
@@ -113,6 +170,22 @@ enum wasp_msg_type {
 /* HELLO_ACK feature bits. */
 #define WASP_FEAT_REMOTE_MEM 0x01
 #define WASP_FEAT_ATOMICS 0x02
+#define WASP_FEAT_MULTI_INSTANCE 0x04
+
+/* DROP kinds. */
+#define WASP_DROP_INSTANCE 0
+#define WASP_DROP_MODULE 1
+
+/*
+ * Module and instance handles: (gen:4 | idx:4). Four bits of index caps
+ * the tables at 16, which is far above what a 64 KiB linear memory per
+ * instance allows on any board this runs on, and leaves four bits of
+ * generation to retire handles with.
+ */
+#define WASP_HANDLE_SLOTS 16
+#define WASP_HANDLE(idx, gen) ((uint8_t)((((gen) & 0x0F) << 4) | ((idx) & 0x0F)))
+#define WASP_HANDLE_IDX(h) ((uint8_t)((h) & 0x0F))
+#define WASP_HANDLE_GEN(h) ((uint8_t)(((h) >> 4) & 0x0F))
 
 /* Remote reference packing: (region_id:8 | offset:24). */
 #define WASP_REF_REGION(ref) ((uint32_t)(ref) >> 24)
@@ -133,6 +206,8 @@ enum wasp_err {
 	WASP_ERR_NO_FUNC = 0x0B,     /* export not found in loaded module */
 	WASP_ERR_LOCKED = 0x0C,      /* region lock held by someone else */
 	WASP_ERR_NO_REGION = 0x0D,   /* remote reference names no exported region */
+	WASP_ERR_BAD_HANDLE = 0x0E,  /* module/instance handle unknown or retired */
+	WASP_ERR_NO_SLOTS = 0x0F,    /* table full, or the pool cannot fit another */
 };
 
 /*

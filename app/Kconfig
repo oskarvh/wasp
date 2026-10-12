@@ -14,6 +14,25 @@ config WASP_AGENT_PORT
 	int "TCP port the agent listens on"
 	default 4242
 
+config WASP_MAX_INSTANCES
+	int "Module instances a node will host at once"
+	default 3
+	range 1 16
+	help
+	  Upper bound on the module and instance tables, and therefore on the
+	  executor pool and the remote-memory RPC slots — one thread and one
+	  RPC slot per instance, so that an instance parked on a round trip
+	  does not hold up the others.
+
+	  This is a ceiling, not a reservation: instances are only created on
+	  demand and an INSTANTIATE that the WAMR pool cannot fit answers
+	  ERROR(NO_SLOTS). What it does reserve is one executor stack each
+	  (WASP_EXEC_THREAD_STACK_SIZE), which comes out of the same RAM the
+	  pool would otherwise fill, so raising it past what the pool can
+	  back costs memory and buys nothing. A 64 KiB linear-memory page per
+	  instance means roughly three fit on 320 KB of SRAM and one on
+	  192 KB.
+
 config WASP_WAMR_POOL_FILL_RAM
 	bool "Give WAMR all the RAM left over after static allocation"
 	default y

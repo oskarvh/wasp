@@ -12,6 +12,7 @@
 #include <zephyr/sys/byteorder.h>
 
 #include "netup.h"
+#include "wamr/wamr_runtime.h"
 #include "wasp.h"
 
 LOG_MODULE_REGISTER(wasp_announce, LOG_LEVEL_INF);
@@ -30,17 +31,31 @@ static void announce_thread_fn(void *a, void *b, void *c)
 	ARG_UNUSED(b);
 	ARG_UNUSED(c);
 
-	uint8_t pkt[9 + sizeof(ANNOUNCE_BOARD) - 1];
+	/*
+	 * The capacity fields go after the board name, which is what makes
+	 * them optional: a reader that stops at the end of the name sees
+	 * exactly the datagram it saw before. They are worth sending because
+	 * `busy` is too coarse once a node has several instance slots — one
+	 * call in flight out of three is not busy — and because the WAMR
+	 * pool is sized at boot from whatever RAM the board had spare, so
+	 * how much a node can host is a property of the node and not of the
+	 * firmware. A coordinator can now size a job before connecting.
+	 */
+#define CAP_OFF (9 + sizeof(ANNOUNCE_BOARD) - 1)
+
+	uint8_t pkt[CAP_OFF + 6];
 	bool sending = true;
 
 	pkt[0] = WASP_PROTO_MAGIC0;
 	pkt[1] = WASP_PROTO_MAGIC1;
 	pkt[2] = WASP_MSG_ANNOUNCE;
 	pkt[3] = WASP_PROTO_VERSION;
-	pkt[4] = WASP_FEAT_REMOTE_MEM | WASP_FEAT_ATOMICS;
+	pkt[4] = WASP_FEAT_REMOTE_MEM | WASP_FEAT_ATOMICS |
+		 (CONFIG_WASP_MAX_INSTANCES > 1 ? WASP_FEAT_MULTI_INSTANCE : 0);
 	sys_put_le16(CONFIG_WASP_AGENT_PORT, &pkt[5]);
 	pkt[8] = sizeof(ANNOUNCE_BOARD) - 1;
 	memcpy(&pkt[9], ANNOUNCE_BOARD, sizeof(ANNOUNCE_BOARD) - 1);
+	pkt[CAP_OFF] = CONFIG_WASP_MAX_INSTANCES;
 
 	/* Nothing to announce until the network is up (take-and-give,
 	 * so other waiters — e.g. a conductor thread — run too). */
@@ -69,6 +84,8 @@ static void announce_thread_fn(void *a, void *b, void *c)
 
 	while (true) {
 		pkt[7] = atomic_get(&wasp_node_busy) ? 1 : 0;
+		pkt[CAP_OFF + 1] = wasp_wamr_free_slots();
+		sys_put_le32(wasp_wamr_pool_free(), &pkt[CAP_OFF + 2]);
 
 		ssize_t n = zsock_sendto(sock, pkt, sizeof(pkt), 0, (struct sockaddr *)&dest,
 					 sizeof(dest));

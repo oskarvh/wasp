@@ -43,6 +43,11 @@ PONG = 0x09
 IDENTIFY = 0x0A
 REBOOT = 0x0B
 ANNOUNCE = 0x0C
+MODULE_UPLOAD = 0x0D
+INSTANTIATE = 0x0E
+CALL_INST = 0x0F
+DROP = 0x10
+INVENTORY = 0x11
 MEM_READ = 0x40
 MEM_DATA = 0x41
 MEM_WRITE = 0x42
@@ -59,6 +64,19 @@ NODE_REQUESTS = {MEM_READ, MEM_WRITE, LOCK, UNLOCK, REGION_INFO, MEM_ADD, MEM_CA
 
 FEAT_REMOTE_MEM = 0x01
 FEAT_ATOMICS = 0x02
+FEAT_MULTI_INSTANCE = 0x04
+
+DROP_INSTANCE = 0
+DROP_MODULE = 1
+
+# Handles are (gen:4 | idx:4); the generation retires a freed slot so a
+# stale handle is refused rather than hitting whatever took its place.
+def handle_idx(h: int) -> int:
+    return h & 0x0F
+
+
+def handle_gen(h: int) -> int:
+    return (h >> 4) & 0x0F
 LOCK_LEASE_S = 5.0
 # Queued-lock mode: how long a LOCK may stay parked before the
 # coordinator gives up and answers ERROR(LOCKED). Must stay under the
@@ -85,6 +103,8 @@ ERR_NAMES = {
     0x0B: "NO_FUNC",
     0x0C: "LOCKED",
     0x0D: "NO_REGION",
+    0x0E: "BAD_HANDLE",
+    0x0F: "NO_SLOTS",
 }
 
 # wasp.* host function return codes as seen by the module
@@ -119,13 +139,21 @@ def discover(timeout: float = 6.0, port: int = ANNOUNCE_PORT) -> dict[str, dict]
         if len(data) < 9 or data[:2] != MAGIC or data[2] != ANNOUNCE:
             continue
         board_len = data[8]
-        nodes[ip] = {
+        info = {
             "version": data[3],
             "features": data[4],
             "port": struct.unpack_from("<H", data, 5)[0],
             "busy": bool(data[7]),
             "board": data[9:9 + board_len].decode(errors="replace"),
         }
+        # Capacity is appended after the board name and is optional, so a
+        # node that predates it simply reports none.
+        cap = 9 + board_len
+        if len(data) >= cap + 6:
+            info["slots_total"] = data[cap]
+            info["slots_free"] = data[cap + 1]
+            info["pool_free"] = struct.unpack_from("<I", data, cap + 2)[0]
+        nodes[ip] = info
     sock.close()
     return nodes
 
@@ -344,15 +372,78 @@ class WaspNode:
             raise ValueError(f"unload failed: {err_name(payload)}")
 
     def call(self, func: str, *args: int) -> list[int]:
-        """Call an exported i32 function; returns its results."""
+        """Call an exported i32 function on the default instance."""
+        t, _, payload = self.request(CALL, self._call_payload(func, args))
+        return self._call_result(func, t, payload)
+
+    # -- multi-instance (FEAT_MULTI_INSTANCE) --------------------------
+
+    @staticmethod
+    def _call_payload(func: str, args) -> bytes:
         name = func.encode()
-        payload = (bytes([len(name)]) + name + bytes([len(args)])
-                   + b"".join(struct.pack("<i", a) for a in args))
-        t, _, payload = self.request(CALL, payload)
+        return (bytes([len(name)]) + name + bytes([len(args)])
+                + b"".join(struct.pack("<i", a) for a in args))
+
+    @staticmethod
+    def _call_result(func: str, t: int, payload: bytes) -> list[int]:
         if t != RESULT:
             raise ValueError(f"call {func} failed: {err_name(payload)}")
         n = payload[0]
         return [struct.unpack("<i", payload[1 + 4 * i:5 + 4 * i])[0] for i in range(n)]
+
+    def upload(self, wasm: bytes, n_inst: int = 1) -> tuple[int, list[int]]:
+        """Upload bytecode once and instantiate it n_inst times.
+
+        Returns (module handle, [instance handles]). n_inst=0 uploads
+        without instantiating; n_inst>1 is the whole point — the binary
+        crosses the wire once however many instances come back.
+        """
+        t, _, payload = self.request(MODULE_UPLOAD, bytes([n_inst]) + wasm)
+        if t != RESULT:
+            raise ValueError(f"upload failed: {err_name(payload)}")
+        mod, n = payload[0], payload[1]
+        return mod, list(payload[2:2 + n])
+
+    def instantiate(self, mod: int, count: int = 1) -> list[int]:
+        """Add instances of bytecode the node already holds."""
+        t, _, payload = self.request(INSTANTIATE, bytes([mod, count]))
+        if t != RESULT:
+            raise ValueError(f"instantiate failed: {err_name(payload)}")
+        return list(payload[1:1 + payload[0]])
+
+    def call_inst(self, inst: int, func: str, *args: int) -> list[int]:
+        """Call an exported i32 function on a specific instance."""
+        t, _, payload = self.request(
+            CALL_INST, bytes([inst]) + self._call_payload(func, args))
+        return self._call_result(func, t, payload)
+
+    def drop_instance(self, inst: int):
+        t, _, payload = self.request(DROP, bytes([DROP_INSTANCE, inst]))
+        if t != RESULT:
+            raise ValueError(f"drop instance failed: {err_name(payload)}")
+
+    def drop_module(self, mod: int):
+        """Drop bytecode and every instance of it."""
+        t, _, payload = self.request(DROP, bytes([DROP_MODULE, mod]))
+        if t != RESULT:
+            raise ValueError(f"drop module failed: {err_name(payload)}")
+
+    def inventory(self) -> dict:
+        """What is resident on the node and how much room is left."""
+        t, _, payload = self.request(INVENTORY)
+        if t != RESULT:
+            raise ValueError(f"inventory failed: {err_name(payload)}")
+        slots_total, slots_free = payload[0], payload[1]
+        pool_free = struct.unpack_from("<I", payload, 2)[0]
+        n_mod = payload[6]
+        at, modules = 7, []
+        for _ in range(n_mod):
+            mod, n_inst = payload[at], payload[at + 1]
+            modules.append({"mod": mod,
+                            "instances": list(payload[at + 2:at + 2 + n_inst])})
+            at += 2 + n_inst
+        return {"slots_total": slots_total, "slots_free": slots_free,
+                "pool_free": pool_free, "modules": modules}
 
 
 def check(name: str, ok: bool, detail: str = ""):
@@ -547,6 +638,83 @@ def cmd_remote2(node: WaspNode, args):
     print("all phase-2 ergonomics checks passed")
 
 
+def cmd_instances(node: WaspNode, args):
+    """Multi-instance self-test: several instances, several programs."""
+    wasm_a = open(args.module, "rb").read()
+    wasm_b = open(args.module2, "rb").read() if args.module2 else None
+
+    _, _, features = node.hello()
+    check("node advertises MULTI_INSTANCE", bool(features & FEAT_MULTI_INSTANCE))
+
+    inv = node.inventory()
+    total = inv["slots_total"]
+    check("inventory reports capacity",
+          total >= 1 and inv["slots_free"] == total,
+          f"{inv['slots_free']}/{total} slots free, pool {inv['pool_free']} B")
+
+    # One transfer of the bytecode, several instances out of it.
+    want = min(2, total)
+    mod_a, insts = node.upload(wasm_a, want)
+    check(f"upload + {want} instances in one round trip",
+          len(insts) == want and len(set(insts)) == want, f"handles {insts}")
+
+    # Each instance answers on its own.
+    ok = all(node.call_inst(i, "add", 20, 22) == [42] for i in insts)
+    check("every instance executes independently", ok)
+
+    # A second, unrelated program resident at the same time. This is the
+    # property that matters: instances are not tied to shared bytecode.
+    if wasm_b is not None and inv["slots_free"] - want >= 1:
+        mod_b, (inst_b,) = node.upload(wasm_b, 1)
+        check("a different module loads alongside", mod_b != mod_a,
+              f"modules {mod_a} and {mod_b}")
+        inv = node.inventory()
+        check("inventory lists both modules", len(inv["modules"]) == 2,
+              f"{[m['mod'] for m in inv['modules']]}")
+        check("first module still runs with the second resident",
+              node.call_inst(insts[0], "add", 1, 2) == [3])
+        node.drop_module(mod_b)
+        check("dropping one module leaves the other",
+              node.call_inst(insts[0], "add", 2, 3) == [5])
+
+    # A retired handle must be refused rather than hit whatever replaced it.
+    victim = insts[-1]
+    node.drop_instance(victim)
+    check("stale instance handle -> BAD_HANDLE",
+          expect_error(node, CALL_INST,
+                       bytes([victim]) + WaspNode._call_payload("add", (1, 1)),
+                       "BAD_HANDLE"))
+
+    # Re-instantiating reuses the slot but not the handle.
+    again = node.instantiate(mod_a, 1)
+    check("instantiate adds to existing bytecode", len(again) == 1,
+          f"handle {again[0]}")
+    check("the reused slot has a fresh generation",
+          handle_idx(again[0]) == handle_idx(victim) and again[0] != victim,
+          f"{victim} -> {again[0]}")
+    check("the new instance runs", node.call_inst(again[0], "add", 7, 7) == [14])
+
+    # Dropping the module takes its instances with it.
+    node.drop_module(mod_a)
+    check("drop module removes its instances",
+          expect_error(node, CALL_INST,
+                       bytes([insts[0]]) + WaspNode._call_payload("add", (1, 1)),
+                       "BAD_HANDLE"))
+    inv = node.inventory()
+    check("everything released", inv["slots_free"] == total and not inv["modules"],
+          f"{inv['slots_free']}/{total} free, pool {inv['pool_free']} B")
+
+    # The v1 messages must still mean what they always did.
+    node.load(wasm_a)
+    check("v1 load + call still work", node.call("add", 2, 3) == [5])
+    check("v1 double load still -> BUSY", expect_error(node, LOAD_MODULE, wasm_a, "BUSY"))
+    node.unload()
+    check("v1 unload still works",
+          expect_error(node, CALL, WaspNode._call_payload("add", (1, 1)), "NO_MODULE"))
+
+    print("all multi-instance checks passed")
+
+
 def cmd_load(node: WaspNode, args):
     node.hello()
     node.load(open(args.module, "rb").read())
@@ -633,6 +801,9 @@ def main():
     p = sub.add_parser("remote2", help="transparent remote pointer self-test")
     p.add_argument("as_module", help="path to remote_as_module.wasm")
     p.add_argument("cpp_module", help="path to remote_cpp_module.wasm")
+    p = sub.add_parser("instances", help="multi-instance self-test")
+    p.add_argument("module", help=".wasm exporting add(i32,i32)")
+    p.add_argument("module2", nargs="?", help="a second, different .wasm")
     p = sub.add_parser("load", help="load a module")
     p.add_argument("module", help="path to .wasm file")
     sub.add_parser("unload", help="unload the module")
@@ -651,7 +822,8 @@ def main():
     print(f"connected to {args.host}:{args.port}")
 
     handlers = {"check": cmd_check, "lifecycle": cmd_lifecycle, "remote": cmd_remote,
-                "remote2": cmd_remote2, "load": cmd_load, "unload": cmd_unload,
+                "remote2": cmd_remote2, "instances": cmd_instances,
+                "load": cmd_load, "unload": cmd_unload,
                 "call": cmd_call, "identify": cmd_identify, "reboot": cmd_reboot,
                 None: cmd_check}
     handlers[args.cmd](node, args)

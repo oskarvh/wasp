@@ -29,7 +29,21 @@ LOG_MODULE_REGISTER(wasp_remote, LOG_LEVEL_INF);
 /* Connection generation of the CALL being executed (set by the executor
  * before wasm_runtime_call_wasm), so RPC responses can be routed and
  * stale ones discarded. */
-uint8_t wasp_exec_conn;
+/*
+ * Which coordinator connection to stamp an RPC with. It used to be one
+ * file-scope global, set by the executor before entering the module —
+ * correct only while a single thread could be mid-call. With a pool of
+ * executors it has to be per-call state, so the executor points the
+ * exec_env's user data straight at the connection byte of the instance
+ * slot. Pointing it at the byte rather than at the slot is deliberate:
+ * it keeps this file from depending on struct inst_slot's layout.
+ */
+static uint8_t conn_of(wasm_exec_env_t exec_env)
+{
+	const uint8_t *conn = wasm_runtime_get_user_data(exec_env);
+
+	return (conn != NULL) ? *conn : 0;
+}
 
 #define RPC_TIMEOUT K_MSEC(CONFIG_WASP_RPC_TIMEOUT_MS)
 
@@ -58,7 +72,7 @@ static int32_t map_error(const struct wasp_msg *resp)
 static int rpc(wasm_exec_env_t exec_env, uint8_t type, const void *payload, uint32_t len,
 	       struct wasp_msg *resp)
 {
-	int rc = wasp_rpc_call(type, payload, len, wasp_exec_conn, resp, RPC_TIMEOUT);
+	int rc = wasp_rpc_call(type, payload, len, conn_of(exec_env), resp, RPC_TIMEOUT);
 
 	if (rc != 0) {
 		wasm_runtime_set_exception(wasm_runtime_get_module_inst(exec_env),

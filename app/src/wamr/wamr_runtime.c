@@ -1,15 +1,33 @@
 /*
- * WAMR runtime wrapper + WASM executor thread.
+ * WAMR runtime wrapper + the WASM executor pool.
  *
- * The executor is the only thread that touches the WAMR runtime. It
- * consumes LOAD_MODULE / UNLOAD_MODULE / CALL messages from wasp_exec_q
- * (serialized, so a module can never be unloaded mid-call) and answers
- * the coordinator directly on wasp_tx_q.
+ * Two tables, mirroring WAMR's own split. A *module* is validated
+ * bytecode (wasm_module_t) plus the raw .wasm buffer, which has to stay
+ * allocated because the interpreter references it. An *instance* is an
+ * instantiation of a module (wasm_module_inst_t) with its own linear
+ * memory and exec_env. Several instances may share one module, and
+ * unrelated modules coexist — nothing ties a node's instances to one
+ * program.
  *
- * The runtime allocates exclusively from a static pool
- * (CONFIG_WASP_WAMR_HEAP_POOL_SIZE) so WASM memory is bounded and cannot
- * starve the kernel. One module at a time; the raw .wasm buffer stays
- * allocated (WAMR references it in interpreter mode) until unload.
+ * CONFIG_WASP_MAX_INSTANCES executor threads drain the shared
+ * wasp_exec_q. Any thread handles any message, which is what lets an
+ * instance blocked on a remote-memory round trip sit out of the way while
+ * other instances run. Two constraints keep that safe:
+ *
+ *   - A single mutex (table_lock) guards both tables. It is held across
+ *     load, instantiate and drop, but never across a WASM call.
+ *   - An instance carries a `running` flag, claimed under that mutex, so
+ *     only one call executes per instance at a time. A wasm_module_inst_t
+ *     and its exec_env are not re-entrant; a second concurrent CALL_INST
+ *     on the same instance is answered ERROR(BUSY) rather than serialised,
+ *     because a coordinator that did that wants to know.
+ *
+ * The runtime allocates exclusively from one pool (see wasp_wamr_init) so
+ * WASM memory is bounded and cannot starve the kernel.
+ *
+ * The v1 single-module messages (LOAD_MODULE / UNLOAD_MODULE / CALL) are
+ * kept as sugar for a default instance, so clients predating the instance
+ * handles keep working unchanged.
  *
  * v1 calling convention: exported functions may only take and return
  * i32 values (max WASP_CALL_MAX_ARGS / WASP_CALL_MAX_RESULTS).
@@ -62,13 +80,76 @@ LOG_MODULE_REGISTER(wasp_wamr, LOG_LEVEL_INF);
 static uint8_t wamr_heap_pool[CONFIG_WASP_WAMR_HEAP_POOL_SIZE] __noinit;
 #endif
 
-/* State of the (single) loaded module. All owned by the executor thread. */
-static struct {
+#define NSLOTS CONFIG_WASP_MAX_INSTANCES
+
+struct mod_slot {
 	uint8_t *buf; /* raw .wasm, from wasp_payload_heap */
 	wasm_module_t module;
+	uint8_t gen;
+	uint8_t refs; /* instances derived from this module */
+	bool used;
+};
+
+struct inst_slot {
 	wasm_module_inst_t inst;
 	wasm_exec_env_t exec_env;
-} loaded;
+	uint8_t mod_idx;
+	uint8_t gen;
+	bool used;
+	bool running;
+	/*
+	 * Which coordinator connection this instance's call came in on.
+	 * Reached from the host functions through
+	 * wasm_runtime_get_user_data(exec_env) — it used to be one global,
+	 * which was correct only while a single thread could be mid-call.
+	 */
+	uint8_t conn;
+};
+
+static struct mod_slot mods[NSLOTS];
+static struct inst_slot insts[NSLOTS];
+static K_MUTEX_DEFINE(table_lock);
+
+/* Resolve a handle to a slot, rejecting retired generations. NULL if the
+ * index is out of range, the slot is free, or the generation has moved on.
+ */
+static struct inst_slot *inst_of(uint8_t handle)
+{
+	uint8_t idx = WASP_HANDLE_IDX(handle);
+
+	if (idx >= NSLOTS || !insts[idx].used) {
+		return NULL;
+	}
+	if (insts[idx].gen != WASP_HANDLE_GEN(handle)) {
+		return NULL;
+	}
+	return &insts[idx];
+}
+
+static struct mod_slot *mod_of(uint8_t handle)
+{
+	uint8_t idx = WASP_HANDLE_IDX(handle);
+
+	if (idx >= NSLOTS || !mods[idx].used) {
+		return NULL;
+	}
+	if (mods[idx].gen != WASP_HANDLE_GEN(handle)) {
+		return NULL;
+	}
+	return &mods[idx];
+}
+
+static uint8_t inst_handle(const struct inst_slot *s)
+{
+	return WASP_HANDLE(s - insts, s->gen);
+}
+
+static uint8_t mod_handle(const struct mod_slot *s)
+{
+	return WASP_HANDLE(s - mods, s->gen);
+}
+
+static size_t wamr_pool_size;
 
 int wasp_wamr_init(void)
 {
@@ -115,6 +196,8 @@ int wasp_wamr_init(void)
 		return -EINVAL;
 	}
 
+	wamr_pool_size = pool_size;
+
 	/* Report the instance budget, since that is what the number means in
 	 * practice: one instance costs a 64 KiB linear-memory page plus the
 	 * aux stack, the app heap and runtime overhead.
@@ -127,111 +210,475 @@ int wasp_wamr_init(void)
 	return 0;
 }
 
-static void unload_module(void)
+/* Instance slots not currently in use. */
+uint8_t wasp_wamr_free_slots(void)
 {
-	if (loaded.exec_env != NULL) {
-		wasm_runtime_destroy_exec_env(loaded.exec_env);
+	uint8_t free_slots = 0;
+
+	k_mutex_lock(&table_lock, K_FOREVER);
+	for (int i = 0; i < NSLOTS; i++) {
+		if (!insts[i].used) {
+			free_slots++;
+		}
 	}
-	if (loaded.inst != NULL) {
-		wasm_runtime_deinstantiate(loaded.inst);
-	}
-	if (loaded.module != NULL) {
-		wasm_runtime_unload(loaded.module);
-	}
-	if (loaded.buf != NULL) {
-		k_heap_free(&wasp_payload_heap, loaded.buf);
-	}
-	memset(&loaded, 0, sizeof(loaded));
+	k_mutex_unlock(&table_lock);
+	return free_slots;
 }
 
 /*
- * Load + instantiate the module in msg->payload. On success the executor
- * takes ownership of the payload buffer; on failure it is freed here.
+ * Bytes WAMR still has to hand out. Pool mode is the only mode
+ * wasm_runtime_get_mem_alloc_info supports, and pool mode is what this
+ * runs in, so this is the real figure rather than an estimate — which
+ * matters because it is what tells a coordinator whether another
+ * instance will fit before it asks for one.
  */
-static void handle_load(struct wasp_msg *msg)
+uint32_t wasp_wamr_pool_free(void)
 {
-	char err[100];
+	mem_alloc_info_t info;
 
-	if (loaded.module != NULL) {
-		wasp_queue_error(msg, WASP_ERR_BUSY, "module already loaded, unload first");
-		goto free_payload;
+	if (!wasm_runtime_get_mem_alloc_info(&info)) {
+		return 0;
 	}
-	if (msg->len == 0) {
-		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "empty module");
-		return;
+	return info.total_free_size;
+}
+
+/* Caller holds table_lock. Tears down an instance and releases its
+ * module reference, unloading the module once nothing refers to it.
+ */
+static void drop_instance_locked(struct inst_slot *s)
+{
+	struct mod_slot *m = &mods[s->mod_idx];
+
+	if (s->exec_env != NULL) {
+		wasm_runtime_destroy_exec_env(s->exec_env);
 	}
-
-	loaded.buf = msg->payload;
-	loaded.module = wasm_runtime_load(loaded.buf, msg->len, err, sizeof(err));
-	if (loaded.module == NULL) {
-		LOG_WRN("module load failed: %s", err);
-		wasp_queue_error(msg, WASP_ERR_LOAD_FAILED, err);
-		goto unload;
+	if (s->inst != NULL) {
+		wasm_runtime_deinstantiate(s->inst);
 	}
+	s->inst = NULL;
+	s->exec_env = NULL;
+	s->running = false;
+	s->used = false;
+	s->gen = (s->gen + 1) & 0x0F; /* retire the handle */
 
-	loaded.inst = wasm_runtime_instantiate(loaded.module, CONFIG_WASP_WASM_STACK_SIZE,
-					       CONFIG_WASP_WASM_HEAP_SIZE, err, sizeof(err));
-	if (loaded.inst == NULL) {
-		LOG_WRN("module instantiation failed: %s", err);
-		wasp_queue_error(msg, WASP_ERR_LOAD_FAILED, err);
-		goto unload;
-	}
-
-	loaded.exec_env = wasm_runtime_create_exec_env(loaded.inst, CONFIG_WASP_WASM_STACK_SIZE);
-	if (loaded.exec_env == NULL) {
-		LOG_WRN("exec env creation failed");
-		wasp_queue_error(msg, WASP_ERR_NO_MEM, "exec env creation failed");
-		goto unload;
-	}
-
-	LOG_INF("module loaded and instantiated (%u bytes)", msg->len);
-	wasp_queue_tx(msg, WASP_MSG_RESULT, NULL, 0);
-	return;
-
-unload:
-	unload_module();
-	return;
-free_payload:
-	if (msg->payload != NULL) {
-		k_heap_free(&wasp_payload_heap, msg->payload);
+	if (m->used && m->refs > 0) {
+		m->refs--;
 	}
 }
 
-static void handle_unload(struct wasp_msg *msg)
+/* Caller holds table_lock. Unloads bytecode; refuses while referenced. */
+static void drop_module_locked(struct mod_slot *m)
 {
-	if (loaded.module == NULL) {
-		wasp_queue_error(msg, WASP_ERR_NO_MODULE, NULL);
+	if (m->refs != 0) {
 		return;
 	}
-	unload_module();
-	LOG_INF("module unloaded");
+	if (m->module != NULL) {
+		wasm_runtime_unload(m->module);
+	}
+	if (m->buf != NULL) {
+		k_heap_free(&wasp_payload_heap, m->buf);
+	}
+	m->module = NULL;
+	m->buf = NULL;
+	m->used = false;
+	m->gen = (m->gen + 1) & 0x0F;
+}
+
+/* Caller holds table_lock. Drops every instance of a module, then it. */
+static void drop_module_tree_locked(struct mod_slot *m)
+{
+	uint8_t idx = m - mods;
+
+	for (int i = 0; i < NSLOTS; i++) {
+		if (insts[i].used && insts[i].mod_idx == idx) {
+			drop_instance_locked(&insts[i]);
+		}
+	}
+	drop_module_locked(m);
+}
+
+/*
+ * Caller holds table_lock. Instantiate one instance of mods[mod_idx].
+ * Returns the handle, or -1 with *err describing why.
+ */
+static int instantiate_locked(uint8_t mod_idx, char *err, size_t errlen)
+{
+	struct mod_slot *m = &mods[mod_idx];
+	struct inst_slot *s = NULL;
+
+	for (int i = 0; i < NSLOTS; i++) {
+		if (!insts[i].used) {
+			s = &insts[i];
+			break;
+		}
+	}
+	if (s == NULL) {
+		return -1;
+	}
+
+	s->inst = wasm_runtime_instantiate(m->module, CONFIG_WASP_WASM_STACK_SIZE,
+					   CONFIG_WASP_WASM_HEAP_SIZE, err, errlen);
+	if (s->inst == NULL) {
+		return -1;
+	}
+	s->exec_env = wasm_runtime_create_exec_env(s->inst, CONFIG_WASP_WASM_STACK_SIZE);
+	if (s->exec_env == NULL) {
+		wasm_runtime_deinstantiate(s->inst);
+		s->inst = NULL;
+		strncpy(err, "exec env creation failed", errlen - 1);
+		return -1;
+	}
+
+	/*
+	 * The host functions reach the connection to answer on through the
+	 * exec_env rather than a global. Point at the field, not the slot:
+	 * native_remote.c then needs no knowledge of this struct's layout.
+	 */
+	wasm_runtime_set_user_data(s->exec_env, &s->conn);
+
+	s->mod_idx = mod_idx;
+	s->used = true;
+	s->running = false;
+	m->refs++;
+	return inst_handle(s);
+}
+
+/*
+ * Load bytecode into a module slot. Takes ownership of buf on success.
+ * Returns the module index, or -1.
+ */
+static int load_locked(uint8_t *buf, uint32_t len, char *err, size_t errlen)
+{
+	struct mod_slot *m = NULL;
+
+	for (int i = 0; i < NSLOTS; i++) {
+		if (!mods[i].used) {
+			m = &mods[i];
+			break;
+		}
+	}
+	if (m == NULL) {
+		return -1;
+	}
+
+	m->module = wasm_runtime_load(buf, len, err, errlen);
+	if (m->module == NULL) {
+		return -1;
+	}
+	m->buf = buf;
+	m->refs = 0;
+	m->used = true;
+	return m - mods;
+}
+
+/*
+ * MODULE_UPLOAD: [n_inst u8][.wasm] -> RESULT [mod][n][inst × n].
+ *
+ * One frame both uploads and instantiates, so the ordinary single-instance
+ * case stays one round trip while n_inst > 1 creates several instances
+ * from one transfer of the bytecode. n_inst = 0 uploads only.
+ */
+static void handle_upload(struct wasp_msg *msg)
+{
+	char err[100] = "";
+	uint8_t reply[2 + NSLOTS];
+	uint32_t n_inst;
+	int mod_idx;
+	uint8_t created = 0;
+
+	if (msg->len < 2) {
+		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "short MODULE_UPLOAD");
+		goto free_payload;
+	}
+	n_inst = msg->payload[0];
+	if (n_inst > NSLOTS) {
+		wasp_queue_error(msg, WASP_ERR_NO_SLOTS, "more instances than slots");
+		goto free_payload;
+	}
+
+	/*
+	 * The .wasm has to outlive this message, and it sits one byte into
+	 * the payload. Rather than keep the whole frame and remember the
+	 * offset forever, copy the module out into its own allocation.
+	 */
+	uint32_t wasm_len = msg->len - 1;
+	uint8_t *buf = k_heap_alloc(&wasp_payload_heap, wasm_len, K_MSEC(100));
+
+	if (buf == NULL) {
+		wasp_queue_error(msg, WASP_ERR_NO_MEM, "no room for the module");
+		goto free_payload;
+	}
+	memcpy(buf, &msg->payload[1], wasm_len);
+
+	k_mutex_lock(&table_lock, K_FOREVER);
+	mod_idx = load_locked(buf, wasm_len, err, sizeof(err));
+	if (mod_idx < 0) {
+		k_mutex_unlock(&table_lock);
+		k_heap_free(&wasp_payload_heap, buf);
+		if (err[0] != '\0') {
+			LOG_WRN("module load failed: %s", err);
+			wasp_queue_error(msg, WASP_ERR_LOAD_FAILED, err);
+		} else {
+			wasp_queue_error(msg, WASP_ERR_NO_SLOTS, "module table full");
+		}
+		goto free_payload;
+	}
+
+	for (uint32_t i = 0; i < n_inst; i++) {
+		int h = instantiate_locked(mod_idx, err, sizeof(err));
+
+		if (h < 0) {
+			break;
+		}
+		reply[2 + created++] = (uint8_t)h;
+	}
+
+	if (created < n_inst) {
+		/* Partial success is worse than none: the coordinator asked
+		 * for a specific width and would have to unpick the rest.
+		 */
+		drop_module_tree_locked(&mods[mod_idx]);
+		k_mutex_unlock(&table_lock);
+		LOG_WRN("could only instantiate %u of %u: %s", created, n_inst, err);
+		wasp_queue_error(msg, WASP_ERR_NO_SLOTS, err[0] ? err : "pool exhausted");
+		goto free_payload;
+	}
+
+	reply[0] = mod_handle(&mods[mod_idx]);
+	reply[1] = created;
+	k_mutex_unlock(&table_lock);
+
+	LOG_INF("module %u uploaded (%u bytes), %u instance(s)", reply[0], wasm_len, created);
+	wasp_queue_tx(msg, WASP_MSG_RESULT, reply, 2 + created);
+
+free_payload:
+	if (msg->payload != NULL) {
+		k_heap_free(&wasp_payload_heap, msg->payload);
+		msg->payload = NULL;
+	}
+}
+
+/* INSTANTIATE: [mod][count] -> RESULT [count][inst × count]. */
+static void handle_instantiate(struct wasp_msg *msg)
+{
+	char err[100] = "";
+	uint8_t reply[1 + NSLOTS];
+	struct mod_slot *m;
+	uint32_t count;
+	uint8_t created = 0;
+
+	if (msg->len < 2) {
+		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "short INSTANTIATE");
+		return;
+	}
+	count = msg->payload[1];
+	if (count == 0 || count > NSLOTS) {
+		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "bad instance count");
+		return;
+	}
+
+	k_mutex_lock(&table_lock, K_FOREVER);
+	m = mod_of(msg->payload[0]);
+	if (m == NULL) {
+		k_mutex_unlock(&table_lock);
+		wasp_queue_error(msg, WASP_ERR_BAD_HANDLE, "no such module");
+		return;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		int h = instantiate_locked(m - mods, err, sizeof(err));
+
+		if (h < 0) {
+			break;
+		}
+		reply[1 + created++] = (uint8_t)h;
+	}
+	if (created < count) {
+		for (uint8_t i = 0; i < created; i++) {
+			drop_instance_locked(inst_of(reply[1 + i]));
+		}
+		k_mutex_unlock(&table_lock);
+		wasp_queue_error(msg, WASP_ERR_NO_SLOTS, err[0] ? err : "pool exhausted");
+		return;
+	}
+	k_mutex_unlock(&table_lock);
+
+	reply[0] = created;
+	LOG_INF("module %u: %u more instance(s)", msg->payload[0], created);
+	wasp_queue_tx(msg, WASP_MSG_RESULT, reply, 1 + created);
+}
+
+/* DROP: [kind][handle]. */
+static void handle_drop(struct wasp_msg *msg)
+{
+	if (msg->len < 2) {
+		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "short DROP");
+		return;
+	}
+
+	k_mutex_lock(&table_lock, K_FOREVER);
+	if (msg->payload[0] == WASP_DROP_INSTANCE) {
+		struct inst_slot *s = inst_of(msg->payload[1]);
+
+		if (s == NULL) {
+			k_mutex_unlock(&table_lock);
+			wasp_queue_error(msg, WASP_ERR_BAD_HANDLE, "no such instance");
+			return;
+		}
+		if (s->running) {
+			k_mutex_unlock(&table_lock);
+			wasp_queue_error(msg, WASP_ERR_BUSY, "instance is executing");
+			return;
+		}
+		uint8_t mod_idx = s->mod_idx;
+
+		drop_instance_locked(s);
+		/* An instance was the only thing keeping its bytecode alive. */
+		if (mods[mod_idx].used && mods[mod_idx].refs == 0) {
+			drop_module_locked(&mods[mod_idx]);
+		}
+	} else if (msg->payload[0] == WASP_DROP_MODULE) {
+		struct mod_slot *m = mod_of(msg->payload[1]);
+
+		if (m == NULL) {
+			k_mutex_unlock(&table_lock);
+			wasp_queue_error(msg, WASP_ERR_BAD_HANDLE, "no such module");
+			return;
+		}
+		for (int i = 0; i < NSLOTS; i++) {
+			if (insts[i].used && insts[i].mod_idx == (m - mods) &&
+			    insts[i].running) {
+				k_mutex_unlock(&table_lock);
+				wasp_queue_error(msg, WASP_ERR_BUSY,
+						 "an instance is executing");
+				return;
+			}
+		}
+		drop_module_tree_locked(m);
+	} else {
+		k_mutex_unlock(&table_lock);
+		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "bad DROP kind");
+		return;
+	}
+	k_mutex_unlock(&table_lock);
+
 	wasp_queue_tx(msg, WASP_MSG_RESULT, NULL, 0);
+}
+
+/* INVENTORY: what is resident and what room is left. */
+static void handle_inventory(const struct wasp_msg *msg)
+{
+	uint8_t reply[7 + NSLOTS * (2 + NSLOTS)];
+	uint32_t n = 0;
+	uint8_t free_slots = 0, n_mod = 0;
+
+	k_mutex_lock(&table_lock, K_FOREVER);
+	for (int i = 0; i < NSLOTS; i++) {
+		if (!insts[i].used) {
+			free_slots++;
+		}
+	}
+	reply[0] = NSLOTS;
+	reply[1] = free_slots;
+	sys_put_le32(wasp_wamr_pool_free(), &reply[2]);
+	n = 7;
+	for (int i = 0; i < NSLOTS; i++) {
+		if (!mods[i].used) {
+			continue;
+		}
+		uint32_t at = n;
+
+		reply[n++] = mod_handle(&mods[i]);
+		reply[n++] = 0;
+		for (int j = 0; j < NSLOTS; j++) {
+			if (insts[j].used && insts[j].mod_idx == i) {
+				reply[n++] = inst_handle(&insts[j]);
+				reply[at + 1]++;
+			}
+		}
+		n_mod++;
+	}
+	k_mutex_unlock(&table_lock);
+	reply[6] = n_mod;
+
+	wasp_queue_tx(msg, WASP_MSG_RESULT, reply, n);
+}
+
+/* The v1 LOAD_MODULE/CALL/UNLOAD_MODULE trio addresses one implicit
+ * instance. Remember which, so those messages keep their old meaning.
+ */
+static uint8_t default_inst;
+static bool default_valid;
+
+static void release(struct inst_slot *slot)
+{
+	k_mutex_lock(&table_lock, K_FOREVER);
+	slot->running = false;
+	k_mutex_unlock(&table_lock);
 }
 
 /*
  * CALL payload: [name_len u8][name][argc u8][arg u32 LE × argc]
  * Reply: RESULT [nresults u8][value u32 LE × nresults], or ERROR.
  */
-static void handle_call(const struct wasp_msg *msg)
+static void handle_call(const struct wasp_msg *msg, bool with_handle)
 {
 	char name[WASP_CALL_MAX_NAME_LEN + 1];
 	wasm_valkind_t kinds[MAX(WASP_CALL_MAX_ARGS, WASP_CALL_MAX_RESULTS)];
 	uint32_t cells[MAX(WASP_CALL_MAX_ARGS, WASP_CALL_MAX_RESULTS)];
 	const uint8_t *p = msg->payload;
+	uint32_t len = msg->len;
 	uint32_t name_len, argc;
+	struct inst_slot *slot;
+	uint8_t handle;
 
-	if (loaded.inst == NULL) {
-		wasp_queue_error(msg, WASP_ERR_NO_MODULE, NULL);
-		return;
+	/*
+	 * CALL_INST names its instance; the v1 CALL means the default one.
+	 * Claiming `running` under the table lock is what keeps two executor
+	 * threads out of the same wasm_module_inst_t — it is not re-entrant,
+	 * and nothing else here would stop them.
+	 */
+	if (with_handle) {
+		if (len < 1) {
+			wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "short CALL_INST");
+			return;
+		}
+		handle = p[0];
+		p++;
+		len--;
+	} else {
+		if (!default_valid) {
+			wasp_queue_error(msg, WASP_ERR_NO_MODULE, NULL);
+			return;
+		}
+		handle = default_inst;
 	}
 
+	k_mutex_lock(&table_lock, K_FOREVER);
+	slot = inst_of(handle);
+	if (slot == NULL) {
+		k_mutex_unlock(&table_lock);
+		wasp_queue_error(msg, with_handle ? WASP_ERR_BAD_HANDLE : WASP_ERR_NO_MODULE,
+				 with_handle ? "no such instance" : NULL);
+		return;
+	}
+	if (slot->running) {
+		k_mutex_unlock(&table_lock);
+		wasp_queue_error(msg, WASP_ERR_BUSY, "instance is already executing");
+		return;
+	}
+	slot->running = true;
+	slot->conn = msg->conn;
+	k_mutex_unlock(&table_lock);
+
 	/* -- parse -- */
-	if (msg->len < 2) {
+	if (len < 2) {
+		release(slot);
 		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "short CALL payload");
 		return;
 	}
 	name_len = p[0];
-	if (name_len == 0 || name_len > WASP_CALL_MAX_NAME_LEN || msg->len < 2u + name_len) {
+	if (name_len == 0 || name_len > WASP_CALL_MAX_NAME_LEN || len < 2u + name_len) {
+		release(slot);
 		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "bad name length");
 		return;
 	}
@@ -239,7 +686,8 @@ static void handle_call(const struct wasp_msg *msg)
 	name[name_len] = '\0';
 
 	argc = p[1 + name_len];
-	if (argc > WASP_CALL_MAX_ARGS || msg->len != 2u + name_len + 4u * argc) {
+	if (argc > WASP_CALL_MAX_ARGS || len != 2u + name_len + 4u * argc) {
+		release(slot);
 		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "bad argument count/length");
 		return;
 	}
@@ -248,47 +696,53 @@ static void handle_call(const struct wasp_msg *msg)
 	}
 
 	/* -- signature check (v1: i32 only) -- */
-	wasm_function_inst_t func = wasm_runtime_lookup_function(loaded.inst, name);
+	wasm_function_inst_t func = wasm_runtime_lookup_function(slot->inst, name);
 
 	if (func == NULL) {
+		release(slot);
 		wasp_queue_error(msg, WASP_ERR_NO_FUNC, name);
 		return;
 	}
 
-	uint32_t param_count = wasm_func_get_param_count(func, loaded.inst);
-	uint32_t result_count = wasm_func_get_result_count(func, loaded.inst);
+	uint32_t param_count = wasm_func_get_param_count(func, slot->inst);
+	uint32_t result_count = wasm_func_get_result_count(func, slot->inst);
 
 	if (param_count != argc) {
+		release(slot);
 		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "argument count mismatch");
 		return;
 	}
 	if (result_count > WASP_CALL_MAX_RESULTS) {
+		release(slot);
 		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "too many results");
 		return;
 	}
-	wasm_func_get_param_types(func, loaded.inst, kinds);
+	wasm_func_get_param_types(func, slot->inst, kinds);
 	for (uint32_t i = 0; i < param_count; i++) {
 		if (kinds[i] != WASM_I32) {
-			wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "non-i32 parameter");
+			release(slot);
+		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "non-i32 parameter");
 			return;
 		}
 	}
-	wasm_func_get_result_types(func, loaded.inst, kinds);
+	wasm_func_get_result_types(func, slot->inst, kinds);
 	for (uint32_t i = 0; i < result_count; i++) {
 		if (kinds[i] != WASM_I32) {
-			wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "non-i32 result");
+			release(slot);
+		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "non-i32 result");
 			return;
 		}
 	}
 
 	/* -- execute -- */
-	wasp_exec_conn = msg->conn;
-	if (!wasm_runtime_call_wasm(loaded.exec_env, func, argc, cells)) {
-		const char *exception = wasm_runtime_get_exception(loaded.inst);
+	if (!wasm_runtime_call_wasm(slot->exec_env, func, argc, cells)) {
+		const char *exception = wasm_runtime_get_exception(slot->inst);
 
 		LOG_WRN("call %s trapped: %s", name, exception ? exception : "?");
+		release(slot);
 		wasp_queue_error(msg, WASP_ERR_TRAP, exception);
-		wasm_runtime_clear_exception(loaded.inst);
+		wasm_runtime_clear_exception(slot->inst);
+		release(slot);
 		return;
 	}
 
@@ -299,7 +753,88 @@ static void handle_call(const struct wasp_msg *msg)
 	for (uint32_t i = 0; i < result_count; i++) {
 		sys_put_le32(cells[i], &reply[1 + 4 * i]);
 	}
+	release(slot);
 	wasp_queue_tx(msg, WASP_MSG_RESULT, reply, 1 + 4 * result_count);
+}
+
+/*
+ * v1 LOAD_MODULE: upload and instantiate exactly one, and remember it as
+ * the default so the v1 CALL and UNLOAD_MODULE keep working. Refuses a
+ * second load the way it always did, since a v1 client has no way to name
+ * which of two modules it meant.
+ */
+static void handle_load_v1(struct wasp_msg *msg)
+{
+	char err[100] = "";
+	uint8_t *buf;
+	int mod_idx, h;
+
+	if (msg->len == 0) {
+		wasp_queue_error(msg, WASP_ERR_BAD_ARGS, "empty module");
+		goto done;
+	}
+	if (default_valid) {
+		wasp_queue_error(msg, WASP_ERR_BUSY, "module already loaded, unload first");
+		goto done;
+	}
+
+	buf = msg->payload;
+	msg->payload = NULL; /* the module table takes it on success */
+
+	k_mutex_lock(&table_lock, K_FOREVER);
+	mod_idx = load_locked(buf, msg->len, err, sizeof(err));
+	if (mod_idx < 0) {
+		k_mutex_unlock(&table_lock);
+		k_heap_free(&wasp_payload_heap, buf);
+		LOG_WRN("module load failed: %s", err);
+		wasp_queue_error(msg, err[0] ? WASP_ERR_LOAD_FAILED : WASP_ERR_NO_SLOTS, err);
+		goto done;
+	}
+	h = instantiate_locked(mod_idx, err, sizeof(err));
+	if (h < 0) {
+		drop_module_tree_locked(&mods[mod_idx]);
+		k_mutex_unlock(&table_lock);
+		LOG_WRN("module instantiation failed: %s", err);
+		wasp_queue_error(msg, WASP_ERR_LOAD_FAILED, err);
+		goto done;
+	}
+	default_inst = (uint8_t)h;
+	default_valid = true;
+	k_mutex_unlock(&table_lock);
+
+	LOG_INF("module loaded and instantiated (%u bytes)", msg->len);
+	wasp_queue_tx(msg, WASP_MSG_RESULT, NULL, 0);
+
+done:
+	if (msg->payload != NULL) {
+		k_heap_free(&wasp_payload_heap, msg->payload);
+		msg->payload = NULL;
+	}
+}
+
+/* v1 UNLOAD_MODULE: drop the default instance and its bytecode. */
+static void handle_unload_v1(struct wasp_msg *msg)
+{
+	struct inst_slot *slot;
+
+	k_mutex_lock(&table_lock, K_FOREVER);
+	slot = default_valid ? inst_of(default_inst) : NULL;
+	if (slot == NULL) {
+		k_mutex_unlock(&table_lock);
+		wasp_queue_error(msg, WASP_ERR_NO_MODULE, NULL);
+		return;
+	}
+	if (slot->running) {
+		k_mutex_unlock(&table_lock);
+		wasp_queue_error(msg, WASP_ERR_BUSY, "instance is executing");
+		return;
+	}
+	drop_module_tree_locked(&mods[slot->mod_idx]);
+	default_valid = false;
+	k_mutex_unlock(&table_lock);
+
+	LOG_INF("module unloaded");
+	wasp_queue_tx(msg, WASP_MSG_RESULT, NULL, 0);
 }
 
 static void exec_thread_fn(void *a, void *b, void *c)
@@ -307,10 +842,6 @@ static void exec_thread_fn(void *a, void *b, void *c)
 	ARG_UNUSED(a);
 	ARG_UNUSED(b);
 	ARG_UNUSED(c);
-
-	if (wasp_wamr_init() != 0) {
-		return;
-	}
 
 	while (true) {
 		struct wasp_msg msg;
@@ -320,14 +851,31 @@ static void exec_thread_fn(void *a, void *b, void *c)
 		}
 
 		switch (msg.type) {
+		/* These two free or hand on the payload themselves. */
 		case WASP_MSG_LOAD_MODULE:
-			handle_load(&msg); /* takes/frees payload itself */
+			handle_load_v1(&msg);
 			continue;
+		case WASP_MSG_MODULE_UPLOAD:
+			handle_upload(&msg);
+			continue;
+
 		case WASP_MSG_UNLOAD_MODULE:
-			handle_unload(&msg);
+			handle_unload_v1(&msg);
+			break;
+		case WASP_MSG_INSTANTIATE:
+			handle_instantiate(&msg);
+			break;
+		case WASP_MSG_DROP:
+			handle_drop(&msg);
+			break;
+		case WASP_MSG_INVENTORY:
+			handle_inventory(&msg);
 			break;
 		case WASP_MSG_CALL:
-			handle_call(&msg);
+			handle_call(&msg, false);
+			break;
+		case WASP_MSG_CALL_INST:
+			handle_call(&msg, true);
 			break;
 		default:
 			LOG_ERR("unexpected type 0x%02x on exec queue", msg.type);
@@ -341,5 +889,39 @@ static void exec_thread_fn(void *a, void *b, void *c)
 	}
 }
 
-K_THREAD_DEFINE(wasp_exec_tid, CONFIG_WASP_EXEC_THREAD_STACK_SIZE, exec_thread_fn, NULL, NULL,
-		NULL, K_PRIO_PREEMPT(7), 0, 0);
+/*
+ * CONFIG_WASP_MAX_INSTANCES identical workers on one queue, rather than a
+ * thread per instance plus a queue each. Any worker takes any message, so
+ * a worker parked in wasm_runtime_call_wasm waiting on a remote-memory
+ * round trip leaves the rest free to run other instances — the point of
+ * the exercise. What stops two workers entering the same instance is the
+ * `running` claim in handle_call, not thread affinity.
+ *
+ * One worker is started by wasm_runtime_init below; the rest wait on it,
+ * because wasm_runtime_full_init must happen exactly once and before any
+ * module is touched.
+ */
+static K_THREAD_STACK_ARRAY_DEFINE(exec_stacks, NSLOTS, CONFIG_WASP_EXEC_THREAD_STACK_SIZE);
+static struct k_thread exec_threads[NSLOTS];
+
+static int exec_pool_start(void)
+{
+	if (wasp_wamr_init() != 0) {
+		return -ENODEV;
+	}
+
+	for (int i = 0; i < NSLOTS; i++) {
+		k_thread_create(&exec_threads[i], exec_stacks[i],
+				CONFIG_WASP_EXEC_THREAD_STACK_SIZE, exec_thread_fn,
+				NULL, NULL, NULL, K_PRIO_PREEMPT(7), 0, K_NO_WAIT);
+		k_thread_name_set(&exec_threads[i], "wasp_exec");
+	}
+	LOG_INF("%d executor thread(s)", NSLOTS);
+	return 0;
+}
+
+/* After the payload heap (priority 0) and the PSRAM probe, before the
+ * network comes up and anything can arrive.
+ */
+SYS_INIT(exec_pool_start, POST_KERNEL, 3);
+

@@ -31,7 +31,8 @@ static void handle_hello(const struct wasp_msg *msg)
 
 	ack[0] = WASP_PROTO_VERSION;
 	sys_put_le32(CONFIG_WASP_MAX_MODULE_SIZE, &ack[1]);
-	ack[5] = WASP_FEAT_REMOTE_MEM | WASP_FEAT_ATOMICS;
+	ack[5] = WASP_FEAT_REMOTE_MEM | WASP_FEAT_ATOMICS |
+		 (CONFIG_WASP_MAX_INSTANCES > 1 ? WASP_FEAT_MULTI_INSTANCE : 0);
 	wasp_queue_tx(msg, WASP_MSG_HELLO_ACK, ack, sizeof(ack));
 	LOG_INF("coordinator handshake complete");
 }
@@ -79,6 +80,11 @@ static void handle_msg(struct wasp_msg *msg)
 	case WASP_MSG_LOAD_MODULE:
 	case WASP_MSG_UNLOAD_MODULE:
 	case WASP_MSG_CALL:
+	case WASP_MSG_MODULE_UPLOAD:
+	case WASP_MSG_INSTANTIATE:
+	case WASP_MSG_CALL_INST:
+	case WASP_MSG_DROP:
+	case WASP_MSG_INVENTORY:
 		/* Hand the whole message (payload ownership included) to the
 		 * executor; it answers the coordinator itself. */
 		if (k_msgq_put(&wasp_exec_q, msg, K_MSEC(100)) != 0) {
