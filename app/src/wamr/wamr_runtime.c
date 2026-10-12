@@ -18,6 +18,7 @@
 
 #include <zephyr/devicetree.h>
 #include <zephyr/kernel.h>
+#include <zephyr/linker/linker-defs.h>
 #include <zephyr/linker/section_tags.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
@@ -30,12 +31,36 @@
 LOG_MODULE_REGISTER(wasp_wamr, LOG_LEVEL_INF);
 
 /*
- * Lives in main SRAM, not TCM: instantiating a module requires one
- * contiguous allocation of at least a full 64 KiB WASM page for its
- * linear memory (plus runtime overhead), which can never fit in a
- * 64 KiB TCM. The payload heap uses the TCM instead (see main.c).
+ * The WAMR pool lives in main SRAM, not TCM: instantiating a module needs
+ * one contiguous allocation of at least a full 64 KiB WASM page for its
+ * linear memory (plus runtime overhead), which can never fit in a 64 KiB
+ * TCM. The payload heap uses the TCM instead (see main.c).
+ *
+ * How big it is depends on the board, and deliberately is not spelled out
+ * per board. With CONFIG_WASP_WAMR_POOL_FILL_RAM the pool is whatever RAM
+ * is left over once every static allocation has been placed: the span from
+ * _image_ram_end (the end of data, bss and noinit) to __kernel_ram_end
+ * (the top of the zephyr,sram region). Nothing else is placed there — the
+ * thread stacks, the interrupt stack and the kernel heap are all static
+ * and therefore already below _image_ram_end — so the whole span is free.
+ *
+ * This is how the same firmware gets three concurrent module instances on
+ * the H723's 320 KB and one on the F439's 192 KB without either number
+ * appearing anywhere. It also beats a hand-tuned constant on both: the
+ * static 88 KiB pool was sized for the F439 and left 33 KB of its SRAM
+ * unused, while on the H723 it left 173 KB unused.
+ *
+ * Bounding WASM memory so it cannot starve the kernel still holds, because
+ * everything the kernel needs is allocated before this runs. What changes
+ * is that growing a static buffer now shrinks the pool instead of
+ * overflowing RAM, so CONFIG_WASP_WAMR_HEAP_POOL_SIZE becomes a floor that
+ * init refuses to boot below rather than the size itself.
  */
+#if IS_ENABLED(CONFIG_WASP_WAMR_POOL_FILL_RAM)
+#define POOL_ALIGN 8U
+#else
 static uint8_t wamr_heap_pool[CONFIG_WASP_WAMR_HEAP_POOL_SIZE] __noinit;
+#endif
 
 /* State of the (single) loaded module. All owned by the executor thread. */
 static struct {
@@ -47,11 +72,36 @@ static struct {
 
 int wasp_wamr_init(void)
 {
+	uint8_t *pool;
+	size_t pool_size;
+
+#if IS_ENABLED(CONFIG_WASP_WAMR_POOL_FILL_RAM)
+	uintptr_t start = ROUND_UP((uintptr_t)_image_ram_end, POOL_ALIGN);
+	uintptr_t top = (uintptr_t)__kernel_ram_end;
+
+	if (top <= start) {
+		LOG_ERR("no RAM left for the WAMR pool");
+		return -ENOMEM;
+	}
+	pool = (uint8_t *)start;
+	pool_size = (size_t)(top - start);
+
+	if (pool_size < CONFIG_WASP_WAMR_HEAP_POOL_SIZE) {
+		LOG_ERR("only %zu bytes of RAM left, need %u — shrink a static "
+			"buffer or lower CONFIG_WASP_WAMR_HEAP_POOL_SIZE",
+			pool_size, (unsigned)CONFIG_WASP_WAMR_HEAP_POOL_SIZE);
+		return -ENOMEM;
+	}
+#else
+	pool = wamr_heap_pool;
+	pool_size = sizeof(wamr_heap_pool);
+#endif
+
 	RuntimeInitArgs init_args = {
 		.mem_alloc_type = Alloc_With_Pool,
 		.mem_alloc_option.pool = {
-			.heap_buf = wamr_heap_pool,
-			.heap_size = sizeof(wamr_heap_pool),
+			.heap_buf = pool,
+			.heap_size = (uint32_t)pool_size,
 		},
 	};
 
@@ -65,7 +115,15 @@ int wasp_wamr_init(void)
 		return -EINVAL;
 	}
 
-	LOG_INF("WAMR initialized (heap pool: %u bytes)", (unsigned)sizeof(wamr_heap_pool));
+	/* Report the instance budget, since that is what the number means in
+	 * practice: one instance costs a 64 KiB linear-memory page plus the
+	 * aux stack, the app heap and runtime overhead.
+	 */
+	LOG_INF("WAMR initialized (pool: %zu bytes at %p, %s, ~%zu instance(s))",
+		pool_size, (void *)pool,
+		IS_ENABLED(CONFIG_WASP_WAMR_POOL_FILL_RAM) ? "all spare RAM" : "static",
+		pool_size / (size_t)(65536 + CONFIG_WASP_WASM_STACK_SIZE
+				     + CONFIG_WASP_WASM_HEAP_SIZE));
 	return 0;
 }
 

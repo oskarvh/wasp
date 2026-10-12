@@ -14,15 +14,37 @@ config WASP_AGENT_PORT
 	int "TCP port the agent listens on"
 	default 4242
 
+config WASP_WAMR_POOL_FILL_RAM
+	bool "Give WAMR all the RAM left over after static allocation"
+	default y
+	help
+	  Sizes the WAMR pool at boot to the span between _image_ram_end and
+	  __kernel_ram_end — everything left once data, bss, noinit, the
+	  thread stacks and the kernel heap have been placed.
+
+	  This is what lets one firmware image suit boards with different
+	  amounts of RAM without a per-board constant: the H723's 320 KB
+	  yields about three concurrent module instances and the F439's
+	  192 KB about one, from the same build. It beats a hand-tuned
+	  constant on both, since a figure safe for the smallest board
+	  strands RAM on every larger one.
+
+	  Turn it off to go back to a fixed static array of
+	  WASP_WAMR_HEAP_POOL_SIZE bytes.
+
 config WASP_WAMR_HEAP_POOL_SIZE
-	int "Static heap pool handed to WAMR (bytes)"
+	int "WAMR pool floor (bytes), or its exact size if not filling RAM"
 	default 90112
 	help
 	  All WASM module memory (module structures, linear memory, exec
 	  stacks) is allocated from this pool. A standard clang-built module
 	  needs one contiguous 64 KiB WASM page for linear memory plus
-	  runtime overhead, so this must comfortably exceed 64 KiB. Tune per
-	  board in boards/<board>.conf.
+	  runtime overhead, so this must comfortably exceed 64 KiB.
+
+	  With WASP_WAMR_POOL_FILL_RAM set (the default) this is a floor
+	  rather than the size: the pool takes all spare RAM, and init fails
+	  loudly if that turns out to be less than this. Without it, this is
+	  the exact size of a static array.
 
 config WASP_MAX_MODULE_SIZE
 	int "Maximum accepted .wasm module size (bytes)"
