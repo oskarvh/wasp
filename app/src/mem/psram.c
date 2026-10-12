@@ -26,37 +26,40 @@
  *   0x99  reset             }
  *   0x9F  read ID           SPI mode only
  *
- * KNOWN ISSUE — memory-mapped writes are not yet trustworthy in bulk.
+ * ABANDONED ON V1 — bulk memory-mapped writes do not work, and will not.
  *
- * What works, measured on hardware: reset from either SPI or QPI state,
- * read ID, QPI entry, an indirect QPI write/read round trip, memory-mapped
- * reads of the whole array, and memory-mapped writes in short runs. A
- * 1 Kbyte block written and verified at 64, 32, 16 and 8 bit widths gives
- * zero errors at every width.
+ * What works, measured: reset from either SPI or QPI state, read ID, QPI
+ * entry, indirect QPI round trips, memory-mapped reads of the whole array,
+ * and short memory-mapped writes at 64, 32, 16 and 8 bit widths.
  *
- * What fails: writing in longer runs. Verifying 4 Kbyte at a time, about
- * twelve words per 4 Kbyte read back as zero — roughly one per 352 bytes,
- * right across the 8 Mbyte array. The same addresses pass when the same
- * data is written and verified 1 Kbyte at a time, so it is the length of
- * the write run that matters, not the address.
+ * What does not: writes in bulk. Verified 4 Kbyte at a time, about one word
+ * per 352 bytes reads back as zero across all 8 Mbyte, while the same
+ * addresses pass when written and verified 1 Kbyte at a time.
  *
- * What it is not. The pattern is identical at 68.75 MHz and at 19.6 MHz,
- * so it is not marginal sampling. It is unchanged with the refresh counter
- * disabled and the chip-select boundary dropped from 1 Kbyte to 32 bytes,
- * so it is neither tCEM enforcement nor burst chopping. It is unchanged
- * with the region non-cacheable, so it is not the D-cache. A bad word
- * reads as zero rather than as the 0xFFFFFFFF pre-fill underneath it.
+ * Why, and why it is not fixable here. On an AXI-attached OCTOSPI,
+ * memory-mapped writes are issued in multiples of the 64-bit bus width. The
+ * DQSE bit this driver has to set in OCTOSPI_WCCR — without which a write
+ * returns an error response and strands the controller asserted and BUSY —
+ * also stops AXI byte-enable masking from working, so lanes that should be
+ * masked get written anyway. That is an acknowledged STM32 limitation for
+ * quad SDR PSRAM, and ST's own answer to the identical symptom on an H7B0
+ * with an APS6404L is to use an octal (OPI) part instead. Ruled out by
+ * experiment first: sampling (identical at 68.75 MHz and 19.6 MHz), tCEM
+ * enforcement and burst chopping (unchanged with the refresh counter off and
+ * the chip-select boundary at 32 bytes rather than 1 Kbyte), and the D-cache
+ * (unchanged with the region non-cacheable).
  *
- * This is consistent with ST's own advice in community reports on several
- * STM32 families: memory-mapped programming of an external memory is not
- * recommended, and indirect write mode is. psram_xfer_qpi() already does
- * indirect transfers correctly and is the basis of whatever comes next.
+ * Note that fitting the APS6404L the board actually specifies would not have
+ * helped — same device class, and the ST report describing this failure is
+ * an APS6404L. The fitted VTI7064MSME is not at fault.
  *
- * Consequence for now: the self-test fails, wasp_psram_ready() stays
- * false, and nothing allocates out of PSRAM. The board boots and networks
- * normally. Do not move the WAMR pool here until this is resolved, since
- * WASM linear memory is written with ordinary stores and would hit exactly
- * this path.
+ * So: this driver stays, because it proves the hardware out at boot and
+ * because V2 will want the DT and MPU groundwork, but wasp_psram_ready()
+ * returns false unless CONFIG_WASP_PSRAM_ALLOW is set, and nothing
+ * allocates here. The WAMR pool in particular must stay in SRAM: WASM
+ * linear memory is a plain uint8 * that the interpreter stores through
+ * directly, so there is no indirect-write path to route it through.
+ * docs/hardware.md "PSRAM part selection" carries the V2 decision.
  *
  * The one hard timing constraint is tCEM, the maximum time chip select
  * may stay low: 4 us on this part, half the APS6404L's 8 us. Section 4.6
@@ -600,6 +603,10 @@ static int psram_init(void)
 	}
 
 	psram_ok = true;
+	if (!IS_ENABLED(CONFIG_WASP_PSRAM_ALLOW)) {
+		LOG_INF("reads verified; bulk writes broken on quad SDR, "
+			"not offered for allocation");
+	}
 	LOG_INF("%u MB mapped at 0x%08x, %u.%02u MHz (/%u), tCEM %u ns -> refresh %u clk",
 		(unsigned int)(PSRAM_SIZE_BYTES >> 20), (unsigned int)PSRAM_BASE_ADDR,
 		psram_clk_hz / 1000000U, (psram_clk_hz % 1000000U) / 10000U,
@@ -755,7 +762,10 @@ SYS_INIT(psram_selftest, POST_KERNEL, 2);
 
 bool wasp_psram_ready(void)
 {
-	return psram_ok;
+	/* Mapped and short-checked is not the same as safe to allocate from.
+	 * See the header comment: bulk writes are broken on v1 hardware.
+	 */
+	return psram_ok && IS_ENABLED(CONFIG_WASP_PSRAM_ALLOW);
 }
 
 void *wasp_psram_base(void)

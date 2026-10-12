@@ -71,7 +71,14 @@ The deciding constraint: PSRAM-as-transparent-heap needs
 **memory-mapped writes**, which means **OCTOSPI** — the H72x/H73x
 line. The H743's QUADSPI only memory-maps reads (writes are
 indirect-mode), which would force FMC SDRAM: ~45 length-matched pins
-and big packages, the opposite of cheap. The H7A3/H7B3 have OCTOSPI
+and big packages, the opposite of cheap.
+
+> OCTOSPI is necessary but, as built, not sufficient: memory-mapped
+> writes also turned out to depend on the *device width*, and on this
+> silicon they do not work reliably to a **quad** PSRAM. The MCU choice
+> is unaffected — an H72x/H73x is required either way — but the memory
+> choice is. See *PSRAM part selection* for the measurements and the
+> V2 decision to go octal. The H7A3/H7B3 have OCTOSPI
 and 1.4 MB SRAM but dropped the Ethernet MAC — disqualified, and the
 switch doesn't rescue them: the switch replaces the *PHY*, not the
 MAC, so the MCU still needs one.
@@ -448,26 +455,118 @@ debugging of the wasp protocol possible without a tap.
 **APS6404L-3SQR-SN** (AP Memory) — 64 Mbit (8 MB), quad (x1/x4) SDR,
 133 MHz, 2.7–3.6 V, **SOP-8**.
 
-### Why not octal
+### Why not octal — the v1 reasoning, and why it was wrong
 
-Because octal PSRAM does not exist in a hand-solderable package. The
-x8 market has standardised on one 24-ball, 6×8 mm miniBGA footprint —
-AP Memory, ISSI and Winbond all ship it and nothing else. This is not
-a sourcing gap to shop around; there is no part to find.
+> **Superseded.** This section records the v1 decision and the argument
+> behind it. Hardware disproved the argument. V2 goes octal — see
+> *V2: go octal* below. Kept because the mistake is instructive and
+> because the packaging and stub analysis further down is still correct.
 
-That turns out not to matter, because **the memory-mapped write came
-from the peripheral, not the device width.** The reason this board
-needs an H72x/H73x rather than an H743 is that the H743's QUADSPI
-memory-maps reads only, while the OCTOSPI peripheral memory-maps
-reads *and* writes — and OCTOSPI drives x1, x2, x4 and x8 devices
-alike. A quad PSRAM on the OCTOSPI peripheral is transparently
-read/write mapped exactly as an octal one would be. The MCU choice
-stands unchanged; only the memory narrows.
+The v1 argument was that octal PSRAM does not exist in a
+hand-solderable package. The x8 market has standardised on one
+24-ball, 6×8 mm miniBGA footprint — AP Memory, ISSI and Winbond all
+ship it and nothing else. That part is accurate and still true.
 
-The quad part gives up nothing else: same 8 MB, same 2.7–3.6 V single
-rail, same self-managed refresh, and it is a jellybean — SOP-8, about
-a dollar, stocked everywhere, the same part that sits on countless
-RP2040 boards.
+The step that was wrong was the next one: that **the memory-mapped
+write came from the peripheral, not the device width.** The premise is
+right — the H743's QUADSPI memory-maps reads only while OCTOSPI maps
+reads *and* writes, and OCTOSPI does drive x1 through x8 alike — but
+the conclusion drawn from it, that "a quad PSRAM on the OCTOSPI
+peripheral is transparently read/write mapped exactly as an octal one
+would be", does not hold on this silicon.
+
+What actually happens, measured on the fitted board:
+
+- Memory-mapped **reads** of the whole 8 MB are correct.
+- Memory-mapped **writes** fail in two different ways depending on one
+  bit. With `DQSE` clear in `OCTOSPI_WCCR`, a write returns an error
+  response and leaves the controller asserted and `BUSY`
+  (`OCTOSPI_SR` = 0x20: BUSY set, TEF clear), which reaches the CPU as
+  an imprecise bus error. Setting `DQSE` — the documented workaround,
+  and necessary even though this package has no DQS pin — clears that
+  and exposes the second failure: writes whose AXI byte enables are not
+  all asserted corrupt the lanes that should have been masked. About
+  one word per 352 bytes reads back as zero across the array.
+- Ruled out by experiment: sampling (identical at 68.75 MHz and
+  19.6 MHz), tCEM enforcement and burst chopping (unchanged with the
+  refresh counter disabled and the chip-select boundary at 32 bytes
+  instead of 1 Kbyte), and the D-cache (unchanged with the region
+  non-cacheable).
+
+The mechanism is an acknowledged STM32 limitation, not a wiring fault
+or a bad part: on an AXI-attached OCTOSPI, memory-mapped writes are
+issued in multiples of the 64-bit bus width, and the DQS workaround
+that makes them complete at all also makes byte-enable masking stop
+working. ST's own guidance for the same symptom on an H7B0 with an
+APS6404L — the exact part this board specifies — is to use an **octal
+(OPI) PSRAM instead**. So the device width was never incidental to
+memory-mapped writes; it is the thing that decides whether they work.
+
+Two corollaries worth stating plainly, because the v1 text implies the
+opposite:
+
+- Fitting the specified APS6404L would not have fixed this. The ST
+  report describing the identical failure *is* an APS6404L. The part
+  actually fitted is a **VTI7064MSME** (a Vilsion quad PSRAM, same
+  pinout, package, density and command set, but tCEM 4 µs rather than
+  8 µs, and a Rev 0.1 "Preliminary" datasheet that contradicts itself
+  on the clock ceiling). It behaves correctly in every mode the
+  controller supports: indirect QPI round trips, memory-mapped reads of
+  all 8 MB, and short memory-mapped writes at 64, 32, 16 and 8 bit
+  widths. The device is not the problem.
+- The MCU choice does still stand. An H72x/H73x is required either
+  way; OCTOSPI is what makes octal possible at all.
+
+The quad part did deliver on everything else claimed for it — same
+8 MB, same 2.7–3.6 V single rail, same self-managed refresh — with one
+exception that only showed up when buying: **it has been persistently
+hard to source.** The APS6404L is Mouser-only in practice, LCSC lists
+it as unavailable, and the LY68L6400 alternative is likewise absent;
+the board shipped with a Vilsion substitute because that was what could
+be bought. "Jellybean, stocked everywhere" was true of the device class
+on hobby boards, not of any orderable line item.
+
+### V2: go octal
+
+**Decision: revision 2 fits an octal PSRAM.** `APS6408L-3OBM-BA`
+(2.7–3.6 V — note the `-3`; the bare `-OBM` is the 1.8 V part and would
+need a third rail plus level translation), 24-ball miniBGA.
+
+Four reasons, in order of weight:
+
+1. **It is the configuration that works.** Memory-mapped writes are
+   the whole point of putting RAM here — WAMR's linear memory is a
+   plain `uint8 *` that the interpreter stores through directly, so
+   there is no indirect-write path to hide behind. Octal with DQS is
+   ST's recommended answer to exactly the failure measured above.
+2. **It is the configuration with a driver.** Zephyr already ships
+   `drivers/memc/memc_stm32_ospi_psram.c`, and it is an octal
+   HyperRAM/Xccela driver for APS256XX-class parts — 8-line
+   instruction, address and data, `MEMTYPE_APMEMORY`, mode registers
+   over a DQS-clocked DTR bus. It was useless for a quad part, which
+   is why `app/src/mem/psram.c` exists. Going octal makes the upstream
+   driver the right one; the remaining work is relaxing its
+   `depends on SOC_SERIES_STM32U5X` and checking it against the H7
+   OCTOSPI HAL, which is a far smaller job than fixing a controller
+   erratum from underneath.
+3. **4× the bandwidth and ~3× lower miss latency**, per the table
+   below — which stops being a "nice if the cache misses hurt"
+   argument once linear memory genuinely lives out there.
+4. **Sourcing.** The 24-ball BGA is a standardised footprint with
+   three vendors shipping it (AP Memory, ISSI, Winbond), against a
+   quad SOP-8 that in practice meant one distributor and a substitute
+   part. The package is harder; the supply is easier.
+
+What it costs: BGA-24 is not hand-solderable, so assembly needs a
+stencil and either hot air or reflow, and the escape routing needs the
+4-layer stack this board already has. DQS becomes a real signal to
+route and length-match with the clock, and the data bus doubles to
+eight lines.
+
+Not to be revisited on the way: the dual-footprint hedge below is
+still a bad idea for the same stub-length reason, and if hedging is
+genuinely wanted the H723's second OCTOSPI instance is the way to do
+it.
 
 ### What it costs
 

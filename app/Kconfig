@@ -171,15 +171,30 @@ config WASP_PSRAM
 	  Hidden. Pulls in the OSPI HAL and pinctrl for app/src/mem/psram.c
 	  whenever a board's devicetree has the PSRAM node enabled.
 
+config WASP_PSRAM_ALLOW
+	bool "Offer the external PSRAM for allocation"
+	depends on WASP_PSRAM
+	help
+	  Off, and it should stay off on v1 hardware. Bulk memory-mapped
+	  writes corrupt roughly one word per 352 bytes there, for reasons
+	  set out at the top of app/src/mem/psram.c — an OCTOSPI AXI
+	  byte-enable limitation on quad SDR parts that no driver setting
+	  fixes. With this off, wasp_psram_ready() returns false and nothing
+	  allocates from the window, though the driver still maps it and
+	  verifies reads at boot.
+
+	  V2 hardware moves to an octal PSRAM, which is the configuration
+	  that works; this option is what turns it on there.
+
 config WASP_PSRAM_SELFTEST
 	bool "Sweep the external PSRAM at boot"
-	default y
 	depends on WASP_PSRAM
 	help
 	  Writes and verifies the whole array three times over: once with
 	  each word holding its own address, once with 0x55/0xAA, and once
 	  through byte and halfword accesses. Costs a second or two of boot
-	  time and reports throughput.
+	  time and reports throughput. Off by default because on v1 hardware
+	  it fails by design — see CONFIG_WASP_PSRAM_ALLOW.
 
 	  The full sweep is the point. The mapped window is cacheable and the
 	  H7's D-cache is on, so a short test would be served from cache and
