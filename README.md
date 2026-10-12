@@ -233,6 +233,12 @@ handled by the Zephyr layers:
 
 Supported boards:
 
+- **wasp node board** (`wasp_node`) — the purpose-built board: STM32H723ZG
+  Cortex-M7 @ 550 MHz, 320 KiB AXI SRAM, a KSZ8794 3-port switch so nodes
+  daisy-chain without external switches, and three instance slots. Board
+  definition lives in-tree at `boards/wasp/wasp_node`, so no `BOARD_ROOT`
+  needs setting — `app/CMakeLists.txt` points at it. Design rationale:
+  [docs/hardware.md](docs/hardware.md).
 - **ST Nucleo-F439ZI** (`nucleo_f439zi`) — Cortex-M4F @ 180 MHz, 192 KiB
   SRAM + 64 KiB CCM, on-board Ethernet (LAN8742 PHY).
 - **Raspberry Pi Pico W** (`rpi_pico/rp2040/w`) — Cortex-M0+ @ 133 MHz,
@@ -258,6 +264,10 @@ pip install -r deps/zephyr/scripts/requirements-base.txt
 export ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb
 export GNUARMEMB_TOOLCHAIN_PATH=/usr   # prefix of arm-none-eabi-gcc
 
+# build & flash — wasp node board (Ethernet via its own switch)
+west build -b wasp_node app -d build/node
+west flash -d build/node   # openocd over an ST-Link V2 on the SWD header (J6)
+
 # build & flash — Nucleo-F439ZI (Ethernet)
 west build -b nucleo_f439zi app
 west flash                 # needs stlink (openocd or STM32CubeProgrammer)
@@ -281,6 +291,50 @@ python3 tools/wasp_client.py <node-ip> reboot --bootsel   # RP2040 only
 cp build/pico/zephyr/zephyr.uf2 /media/$USER/RPI-RP2/
 # node reboots into the new firmware and rejoins the network in ~20 s
 ```
+
+### wasp node board notes
+
+`west flash` uses openocd with `boards/wasp/wasp_node/support/openocd.cfg`,
+which drives an ST-Link **V2** (`interface/stlink.cfg` plus
+`dapdirect_swd`). That is deliberately not the Nucleo's configuration — the
+in-tree Nucleo boards use `stlink-dap.cfg`, the V3 path, which a V2 will
+not answer. For an older V2 or a clone, swap the transport line for
+`hla_swd`; if your SWD pigtail omits NRST, use `reset_config none
+separate`. Both are noted in the file.
+
+Pass `-p` to `west build` after changing Kconfig or devicetree — Kconfig
+results are cached and a plain rebuild will silently keep the old values.
+
+The board has no USB-serial bridge of its own (a bare ST-Link V2 has no
+VCP), so the console comes out on the expansion header: **J9.3 = PD8**
+(board TX), **J9.4 = PD9** (board RX), plus a header ground, at 115200
+8N1. Any 3V3 USB-TTL adapter will do. To use the board's own USB-C as a
+CDC-ACM console instead:
+
+```sh
+west build -b wasp_node app -d build/node -- \
+    -DEXTRA_CONF_FILE=boards/wasp_node_cdc.conf \
+    -DEXTRA_DTC_OVERLAY_FILE=boards/wasp_node_cdc.overlay
+```
+
+A healthy boot looks like this — the switch line is the one to check
+first, because port 4 comes out of reset in RGMII mode and nothing moves
+until the firmware tells it RMII:
+
+```
+wasp_ksz: KSZ8794 found, rev 0
+wasp_ksz: port 4: RMII, clock mode (0x56 = 0xed)
+wasp_ksz: port 1 (J2): link up, autoneg done
+wasp: sysclk 550 MHz from PLL1 (HSE ready, PLL1 locked), HCLK 275 MHz
+wasp_wamr: WAMR initialized (pool: 249992 bytes, all spare RAM, ~3 instance(s))
+wasp_netup: IPv4 address: 10.0.0.189
+```
+
+Ethernet goes to any of the three jacks — **J2 is switch port 1**, J4 is
+port 2, J5 is port 3, and the driver logs which ones have a link three
+seconds after boot. The external PSRAM is mapped but not used; see
+[docs/hardware.md](docs/hardware.md) for why, and
+`CONFIG_WASP_PSRAM_ALLOW`.
 
 Talking to a node — no serial cable needed, nodes announce themselves
 over UDP broadcast (see
