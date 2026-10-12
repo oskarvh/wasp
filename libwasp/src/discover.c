@@ -22,7 +22,11 @@ int wasp_discover(wasp_info *out, uint32_t max, uint32_t timeout_ms,
 
 	while (wasp_now_ms() < deadline) {
 		/* ['W']['A'][ANNOUNCE][version][features][port u16 LE]
-		 * [busy u8][board_len u8][board name] */
+		 * [busy u8][board_len u8][board name]
+		 * [slots_total u8][slots_free u8][pool_free u32 LE]
+		 *
+		 * The capacity tail is optional and sits after the name, so a
+		 * node that predates it simply reports zeros. */
 		uint8_t pkt[512];
 		char ip[46];
 		wasp_info *info = NULL;
@@ -65,6 +69,23 @@ int wasp_discover(wasp_info *out, uint32_t max, uint32_t timeout_ms,
 		if (board_len > sizeof(info->board) - 1)
 			board_len = sizeof(info->board) - 1;
 		memcpy(info->board, pkt + 9, board_len);
+
+		info->slots_total = 0;
+		info->slots_free = 0;
+		info->pool_free = 0;
+		/* Index off the advertised name length, not the clamped one:
+		 * a board name longer than this struct holds is truncated
+		 * above, but the capacity fields still follow the full name. */
+		if ((uint32_t)len >= 9 + (uint32_t)pkt[8] + 6) {
+			const uint8_t *cap = pkt + 9 + pkt[8];
+
+			info->slots_total = cap[0];
+			info->slots_free = cap[1];
+			info->pool_free = (uint32_t)cap[2] |
+					  ((uint32_t)cap[3] << 8) |
+					  ((uint32_t)cap[4] << 16) |
+					  ((uint32_t)cap[5] << 24);
+		}
 	}
 	wasp_net_close(fd);
 	return (int)count;

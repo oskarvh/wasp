@@ -28,10 +28,10 @@ extern "C" {
 #endif
 
 /*
- * Return codes: 0 on success. -0x01..-0x0D is an ERROR frame from the
- * node, its wasp_err code negated (e.g. -WASP_ERR_TRAP); the detail
- * text is kept in wasp_node_error_detail(). -100 and below are local
- * failures.
+ * Return codes: 0 on success. -0x01..-0x0F is an ERROR frame from the
+ * node, its wasp_err code negated (e.g. -WASP_ERR_TRAP, or
+ * -WASP_ERR_BAD_HANDLE for a retired instance handle); the detail text is
+ * kept in wasp_node_error_detail(). -100 and below are local failures.
  */
 enum {
 	WASP_OK = 0,
@@ -132,19 +132,83 @@ int wasp_unload(wasp_node *n);
 int wasp_call(wasp_node *n, const char *fn, const int32_t *argv,
 	      uint32_t argc, int32_t results[WASP_CALL_MAX_RESULTS]);
 
+/* ---- several instances per node (WASP_FEAT_MULTI_INSTANCE) ---------
+ *
+ * A module is validated bytecode; an instance is an instantiation of it
+ * with its own linear memory. Splitting them is what lets one node host
+ * unrelated programs, and what makes "same bytecode, several instances"
+ * expressible: wasp_upload's n_inst sends the binary once and returns
+ * that many instance handles in a single round trip.
+ *
+ * Handles carry a generation, so a handle to a dropped instance is
+ * refused (WASP_E_* from ERROR(BAD_HANDLE)) rather than reaching
+ * whatever later took its slot.
+ *
+ * Nodes that do not advertise WASP_FEAT_MULTI_INSTANCE still work
+ * through wasp_load/wasp_call, which address one implicit instance.
+ */
+
+/* Upload bytecode and instantiate it n_inst times (0 = upload only).
+ * Writes the module handle to *mod_out and the instance handles to
+ * inst_out; returns the number of instances created or a negative error. */
+int wasp_upload(wasp_node *n, const void *wasm, uint32_t len, uint8_t n_inst,
+		uint8_t *mod_out, uint8_t *inst_out, uint8_t inst_cap);
+
+/* More instances of bytecode the node already holds; nothing re-sent. */
+int wasp_instantiate(wasp_node *n, uint8_t mod, uint8_t count,
+		     uint8_t *inst_out, uint8_t inst_cap);
+
+/* Returns the number of i32 results (>= 0) or a negative error. */
+int wasp_call_inst(wasp_node *n, uint8_t inst, const char *fn,
+		   const int32_t *argv, uint32_t argc,
+		   int32_t results[WASP_CALL_MAX_RESULTS]);
+
+int wasp_drop_instance(wasp_node *n, uint8_t inst);
+/* Drops the bytecode and every instance of it. */
+int wasp_drop_module(wasp_node *n, uint8_t mod);
+
+typedef struct {
+	uint8_t slots_total;
+	uint8_t slots_free;
+	uint32_t pool_free; /* bytes the node's WAMR pool has left */
+	uint8_t n_modules;
+	struct {
+		uint8_t mod;
+		uint8_t n_inst;
+		uint8_t inst[WASP_HANDLE_SLOTS];
+	} modules[WASP_HANDLE_SLOTS];
+} wasp_inventory;
+
+int wasp_inventory_get(wasp_node *n, wasp_inventory *out);
+
 /*
- * Async call: send the CALL and return immediately (one outstanding
- * call per node — the node's executor is single-threaded anyway).
- * wasp_call_poll then drains the connection without blocking: it
- * services the node's remote-memory RPCs inline and, once the RESULT
- * or ERROR frame arrives, completes with wasp_call's return
- * convention. While the call is still running it returns
- * WASP_E_AGAIN — interleave polls across nodes to conduct several
- * workers from one thread.
+ * Async calls: send and return immediately, then poll. wasp_call_poll
+ * drains the connection without blocking, services the node's
+ * remote-memory RPCs inline and, once a RESULT or ERROR arrives,
+ * completes with wasp_call's return convention; while nothing has
+ * completed it returns WASP_E_AGAIN. Interleave polls across nodes to
+ * conduct several workers from one thread.
+ *
+ * Up to WASP_MAX_INFLIGHT calls may be outstanding per node, one per
+ * instance — a node runs one call per instance at a time and answers
+ * ERROR(BUSY) to a second on the same one. wasp_call_poll_any completes
+ * whichever responds first and reports which instance that was, which is
+ * the point of having several in flight: a call parked on a
+ * remote-memory round trip does not hold up the others.
+ *
+ * It is safe to issue a synchronous request while async calls are
+ * outstanding; their responses are parsed as they arrive and kept until
+ * polled.
  */
 int wasp_call_async(wasp_node *n, const char *fn, const int32_t *argv,
 		    uint32_t argc);
+int wasp_call_inst_async(wasp_node *n, uint8_t inst, const char *fn,
+			 const int32_t *argv, uint32_t argc);
 int wasp_call_poll(wasp_node *n, int32_t results[WASP_CALL_MAX_RESULTS]);
+int wasp_call_poll_any(wasp_node *n, uint8_t *inst_out,
+		       int32_t results[WASP_CALL_MAX_RESULTS]);
+/* Async calls sent but not yet harvested. */
+int wasp_call_inflight(wasp_node *n);
 
 /* ---- discovery ----------------------------------------------------- */
 
@@ -155,6 +219,17 @@ typedef struct {
 	uint8_t features;
 	uint8_t busy;
 	char board[33];
+	/*
+	 * Capacity, from the optional tail of the ANNOUNCE datagram. Zero
+	 * when the node predates it. Worth having because `busy` is too
+	 * coarse once a node has several instance slots, and because the
+	 * node's WAMR pool is sized at boot from whatever RAM that board
+	 * had spare — so how much it can host is a property of the node,
+	 * and a job can be sized before connecting.
+	 */
+	uint8_t slots_total;
+	uint8_t slots_free;
+	uint32_t pool_free;
 } wasp_info;
 
 /* Listen for ANNOUNCE broadcasts; returns node count (deduped by IP)

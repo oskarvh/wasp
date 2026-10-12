@@ -26,6 +26,8 @@ const char *wasp_strerror(int err)
 		[WASP_ERR_NO_FUNC] = "NO_FUNC",
 		[WASP_ERR_LOCKED] = "LOCKED",
 		[WASP_ERR_NO_REGION] = "NO_REGION",
+		[WASP_ERR_BAD_HANDLE] = "BAD_HANDLE",
+		[WASP_ERR_NO_SLOTS] = "NO_SLOTS",
 	};
 
 	if (err == WASP_OK)
@@ -227,6 +229,63 @@ static int is_node_request(uint8_t type)
 	}
 }
 
+/* ---- async call slots ---------------------------------------------- */
+
+static int parse_call_result(wasp_node *n, uint8_t t, const uint8_t *p,
+			     uint32_t l,
+			     int32_t results[WASP_CALL_MAX_RESULTS]);
+
+static struct wasp_call_slot *slot_by_seq(wasp_node *n, uint8_t seq)
+{
+	int i;
+
+	for (i = 0; i < WASP_MAX_INFLIGHT; i++)
+		if (n->calls[i].in_use && !n->calls[i].done &&
+		    n->calls[i].seq == seq)
+			return &n->calls[i];
+	return NULL;
+}
+
+static void complete_slot(wasp_node *n, struct wasp_call_slot *sl, uint8_t t,
+			  const uint8_t *p, uint32_t l)
+{
+	sl->rc = parse_call_result(n, t, p, l, sl->results);
+	sl->done = 1;
+}
+
+static struct wasp_call_slot *slot_alloc(wasp_node *n)
+{
+	int i;
+
+	for (i = 0; i < WASP_MAX_INFLIGHT; i++)
+		if (!n->calls[i].in_use)
+			return &n->calls[i];
+	return NULL;
+}
+
+/* A transport failure invalidates every outstanding call on the node. */
+static void slots_abort(wasp_node *n)
+{
+	int i;
+
+	for (i = 0; i < WASP_MAX_INFLIGHT; i++) {
+		n->calls[i].in_use = 0;
+		n->calls[i].done = 0;
+	}
+}
+
+int wasp_call_inflight(wasp_node *n)
+{
+	int i, count = 0;
+
+	if (!n)
+		return WASP_E_ARG;
+	for (i = 0; i < WASP_MAX_INFLIGHT; i++)
+		if (n->calls[i].in_use)
+			count++;
+	return count;
+}
+
 int wasp_request(wasp_node *n, uint8_t type, const void *payload,
 		 uint32_t len, uint8_t *rtype, uint8_t *rseq,
 		 const uint8_t **rpayload, uint32_t *rlen)
@@ -255,8 +314,20 @@ int wasp_request(wasp_node *n, uint8_t type, const void *payload,
 				return rc;
 			continue;
 		}
-		if (s != seq)
+		if (s != seq) {
+			/* An async call's response, arriving while we waited
+			 * on a synchronous one. Parse it into its slot now:
+			 * n->rx holds a single frame, so leaving it for the
+			 * poller would lose it to the next frame.
+			 */
+			struct wasp_call_slot *sl = slot_by_seq(n, s);
+
+			if (sl) {
+				complete_slot(n, sl, t, n->rx, l);
+				continue;
+			}
 			return WASP_E_STREAM;
+		}
 		*rtype = t;
 		if (rseq)
 			*rseq = s;
@@ -417,58 +488,287 @@ int wasp_call(wasp_node *n, const char *fn, const int32_t *argv,
 	return parse_call_result(n, t, p, l, results);
 }
 
-/* ---- async calls (the per-node RPC slot) ---------------------------- */
+/* ---- several instances per node ------------------------------------- */
+
+/*
+ * MODULE_UPLOAD [n_inst][.wasm] -> RESULT [mod][n][inst x n].
+ *
+ * The payload is the count followed by the binary, so it cannot be sent
+ * straight from the caller's buffer without a copy. Rather than demand a
+ * scratch buffer of the caller or allocate one, write the count and the
+ * binary as one frame built in n->rx, which is already sized for a whole
+ * module (it has to hold any request or response).
+ */
+int wasp_upload(wasp_node *n, const void *wasm, uint32_t len, uint8_t n_inst,
+		uint8_t *mod_out, uint8_t *inst_out, uint8_t inst_cap)
+{
+	const uint8_t *p;
+	uint8_t t;
+	uint32_t l;
+	int rc, i, count;
+
+	if (!n || !wasm || len == 0)
+		return WASP_E_ARG;
+	if (n->max_payload && len + 1 > n->max_payload)
+		return WASP_E_TOOBIG;
+	if (len + 1 > n->rx_cap)
+		return WASP_E_TOOBIG;
+
+	n->rx[0] = n_inst;
+	memcpy(n->rx + 1, wasm, len);
+	rc = wasp_request(n, WASP_MSG_MODULE_UPLOAD, n->rx, len + 1, &t, NULL,
+			  &p, &l);
+	if (rc != WASP_OK)
+		return rc;
+	if (t == WASP_MSG_ERROR)
+		return node_error(n, p, l);
+	if (t != WASP_MSG_RESULT || l < 2)
+		return WASP_E_UNEXPECTED;
+
+	count = p[1];
+	if (l < (uint32_t)(2 + count))
+		return WASP_E_UNEXPECTED;
+	if (mod_out)
+		*mod_out = p[0];
+	for (i = 0; i < count && inst_out && i < inst_cap; i++)
+		inst_out[i] = p[2 + i];
+	return count;
+}
+
+int wasp_instantiate(wasp_node *n, uint8_t mod, uint8_t count,
+		     uint8_t *inst_out, uint8_t inst_cap)
+{
+	uint8_t req[2];
+	const uint8_t *p;
+	uint8_t t;
+	uint32_t l;
+	int rc, i, made;
+
+	if (!n || count == 0)
+		return WASP_E_ARG;
+	req[0] = mod;
+	req[1] = count;
+	rc = wasp_request(n, WASP_MSG_INSTANTIATE, req, sizeof(req), &t, NULL,
+			  &p, &l);
+	if (rc != WASP_OK)
+		return rc;
+	if (t == WASP_MSG_ERROR)
+		return node_error(n, p, l);
+	if (t != WASP_MSG_RESULT || l < 1)
+		return WASP_E_UNEXPECTED;
+
+	made = p[0];
+	if (l < (uint32_t)(1 + made))
+		return WASP_E_UNEXPECTED;
+	for (i = 0; i < made && inst_out && i < inst_cap; i++)
+		inst_out[i] = p[1 + i];
+	return made;
+}
+
+int wasp_call_inst(wasp_node *n, uint8_t inst, const char *fn,
+		   const int32_t *argv, uint32_t argc,
+		   int32_t results[WASP_CALL_MAX_RESULTS])
+{
+	uint8_t req[3 + WASP_CALL_MAX_NAME_LEN + 4 * WASP_CALL_MAX_ARGS];
+	const uint8_t *p;
+	uint8_t t;
+	uint32_t l;
+	int len, rc;
+
+	if (!n)
+		return WASP_E_ARG;
+	req[0] = inst;
+	len = build_call_req(req + 1, fn, argv, argc);
+	if (len < 0)
+		return len;
+	rc = wasp_request(n, WASP_MSG_CALL_INST, req, (uint32_t)len + 1, &t,
+			  NULL, &p, &l);
+	if (rc != WASP_OK)
+		return rc;
+	return parse_call_result(n, t, p, l, results);
+}
+
+static int drop(wasp_node *n, uint8_t kind, uint8_t handle)
+{
+	uint8_t req[2];
+
+	if (!n)
+		return WASP_E_ARG;
+	req[0] = kind;
+	req[1] = handle;
+	return expect_empty_result(n, WASP_MSG_DROP, req, sizeof(req));
+}
+
+int wasp_drop_instance(wasp_node *n, uint8_t inst)
+{
+	return drop(n, WASP_DROP_INSTANCE, inst);
+}
+
+int wasp_drop_module(wasp_node *n, uint8_t mod)
+{
+	return drop(n, WASP_DROP_MODULE, mod);
+}
+
+int wasp_inventory_get(wasp_node *n, wasp_inventory *out)
+{
+	const uint8_t *p;
+	uint8_t t;
+	uint32_t l, at;
+	int rc, i, j;
+
+	if (!n || !out)
+		return WASP_E_ARG;
+	rc = wasp_request(n, WASP_MSG_INVENTORY, NULL, 0, &t, NULL, &p, &l);
+	if (rc != WASP_OK)
+		return rc;
+	if (t == WASP_MSG_ERROR)
+		return node_error(n, p, l);
+	if (t != WASP_MSG_RESULT || l < 7)
+		return WASP_E_UNEXPECTED;
+
+	memset(out, 0, sizeof(*out));
+	out->slots_total = p[0];
+	out->slots_free = p[1];
+	out->pool_free = (uint32_t)p[2] | ((uint32_t)p[3] << 8) |
+			 ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 24);
+	out->n_modules = p[6];
+	if (out->n_modules > WASP_HANDLE_SLOTS)
+		return WASP_E_UNEXPECTED;
+
+	at = 7;
+	for (i = 0; i < out->n_modules; i++) {
+		uint8_t n_inst;
+
+		if (at + 2 > l)
+			return WASP_E_UNEXPECTED;
+		out->modules[i].mod = p[at];
+		n_inst = p[at + 1];
+		if (n_inst > WASP_HANDLE_SLOTS || at + 2 + n_inst > l)
+			return WASP_E_UNEXPECTED;
+		out->modules[i].n_inst = n_inst;
+		for (j = 0; j < n_inst; j++)
+			out->modules[i].inst[j] = p[at + 2 + j];
+		at += 2 + n_inst;
+	}
+	return WASP_OK;
+}
+
+/* ---- async calls --------------------------------------------------- */
+
+static int call_async(wasp_node *n, int has_inst, uint8_t inst, const char *fn,
+		      const int32_t *argv, uint32_t argc)
+{
+	uint8_t req[3 + WASP_CALL_MAX_NAME_LEN + 4 * WASP_CALL_MAX_ARGS];
+	struct wasp_call_slot *sl;
+	uint32_t off = has_inst ? 1 : 0;
+	int len, rc;
+
+	if (!n)
+		return WASP_E_ARG;
+	sl = slot_alloc(n);
+	if (!sl)
+		return WASP_E_AGAIN; /* WASP_MAX_INFLIGHT already outstanding */
+
+	if (has_inst)
+		req[0] = inst;
+	len = build_call_req(req + off, fn, argv, argc);
+	if (len < 0)
+		return len;
+
+	sl->seq = n->seq = (uint8_t)(n->seq + 1);
+	rc = wasp_send_frame(n->fd,
+			     has_inst ? WASP_MSG_CALL_INST : WASP_MSG_CALL,
+			     sl->seq, req, (uint32_t)len + off);
+	if (rc != WASP_OK)
+		return rc;
+	sl->in_use = 1;
+	sl->done = 0;
+	sl->inst = inst;
+	sl->has_inst = has_inst;
+	return WASP_OK;
+}
 
 int wasp_call_async(wasp_node *n, const char *fn, const int32_t *argv,
 		    uint32_t argc)
 {
-	uint8_t req[2 + WASP_CALL_MAX_NAME_LEN + 4 * WASP_CALL_MAX_ARGS];
-	int len, rc;
-
-	if (!n || n->call_pending)
-		return WASP_E_ARG;
-	len = build_call_req(req, fn, argv, argc);
-	if (len < 0)
-		return len;
-	n->call_seq = n->seq = (uint8_t)(n->seq + 1);
-	rc = wasp_send_frame(n->fd, WASP_MSG_CALL, n->call_seq, req,
-			     (uint32_t)len);
-	if (rc != WASP_OK)
-		return rc;
-	n->call_pending = 1;
-	return WASP_OK;
+	return call_async(n, 0, 0, fn, argv, argc);
 }
 
-int wasp_call_poll(wasp_node *n, int32_t results[WASP_CALL_MAX_RESULTS])
+int wasp_call_inst_async(wasp_node *n, uint8_t inst, const char *fn,
+			 const int32_t *argv, uint32_t argc)
 {
+	return call_async(n, 1, inst, fn, argv, argc);
+}
+
+/* Hand back the first slot whose response has been parsed. */
+static int harvest(wasp_node *n, uint8_t *inst_out,
+		   int32_t results[WASP_CALL_MAX_RESULTS])
+{
+	int i, j;
+
+	for (i = 0; i < WASP_MAX_INFLIGHT; i++) {
+		struct wasp_call_slot *sl = &n->calls[i];
+
+		if (!sl->in_use || !sl->done)
+			continue;
+		if (inst_out)
+			*inst_out = sl->inst;
+		for (j = 0; j < WASP_CALL_MAX_RESULTS && results; j++)
+			results[j] = sl->results[j];
+		sl->in_use = 0;
+		sl->done = 0;
+		return sl->rc;
+	}
+	return WASP_E_AGAIN;
+}
+
+int wasp_call_poll_any(wasp_node *n, uint8_t *inst_out,
+		       int32_t results[WASP_CALL_MAX_RESULTS])
+{
+	int rc;
+
 	if (!n)
 		return WASP_E_ARG;
-	if (!n->call_pending)
+	if (wasp_call_inflight(n) == 0)
 		return WASP_E_ARG;
 
+	/* A response may already have been parsed by a synchronous request
+	 * that ran while this call was outstanding.
+	 */
+	rc = harvest(n, inst_out, results);
+	if (rc != WASP_E_AGAIN)
+		return rc;
+
 	while (wasp_net_readable(n->fd, 0)) {
+		struct wasp_call_slot *sl;
 		uint8_t t, s;
 		uint32_t l;
-		int rc = recv_frame(n, &t, &s, &l);
 
+		rc = recv_frame(n, &t, &s, &l);
 		if (rc != WASP_OK) {
-			n->call_pending = 0;
+			slots_abort(n);
 			return rc;
 		}
 		if (is_node_request(t)) {
 			rc = wasp_host_serve(n, t, s, n->rx, l);
 			if (rc != WASP_OK) {
-				n->call_pending = 0;
+				slots_abort(n);
 				return rc;
 			}
 			continue;
 		}
-		if (s != n->call_seq) {
-			n->call_pending = 0;
+		sl = slot_by_seq(n, s);
+		if (!sl) {
+			slots_abort(n);
 			return WASP_E_STREAM;
 		}
-		n->call_pending = 0;
-		return parse_call_result(n, t, n->rx, l, results);
+		complete_slot(n, sl, t, n->rx, l);
+		return harvest(n, inst_out, results);
 	}
 	return WASP_E_AGAIN;
+}
+
+int wasp_call_poll(wasp_node *n, int32_t results[WASP_CALL_MAX_RESULTS])
+{
+	return wasp_call_poll_any(n, NULL, results);
 }

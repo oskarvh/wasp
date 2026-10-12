@@ -44,6 +44,12 @@ def run(ip: str) -> None:
         ("remote2", wc.cmd_remote2,
          SimpleNamespace(as_module=str(TOOLS / "remote_as_module.wasm"),
                          cpp_module=str(TOOLS / "remote_cpp_module.wasm"))),
+        # The same multi-instance suite wasp_client runs, driven through C:
+        # upload with a count, per-instance calls, handle generations and
+        # the v1 compatibility path all have to behave identically.
+        ("instances", wc.cmd_instances,
+         SimpleNamespace(module=str(TOOLS / "test_module.wasm"),
+                         module2=str(TOOLS / "remote_module.wasm"))),
     ]
     for name, fn, args in suites:
         print(f"[{ip}] {name} (via libwasp)")

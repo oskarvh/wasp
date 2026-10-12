@@ -79,6 +79,19 @@ static void fk_rpc(int fd, uint8_t *nseq, uint8_t type, const void *payload,
 	assert(rseq == seq);
 }
 
+/* Wait for a CALL_INST of the given export; returns its seq. */
+static uint8_t fk_expect_call_inst(int fd, const char *name, uint8_t *inst)
+{
+	uint8_t type, seq, buf[256];
+	uint32_t len;
+
+	assert(fk_recv(fd, &type, &seq, buf, sizeof(buf), &len) == 0);
+	assert(type == WASP_MSG_CALL_INST);
+	*inst = buf[0];
+	assert(buf[1] == strlen(name) && memcmp(buf + 2, name, buf[1]) == 0);
+	return seq;
+}
+
 /* Wait for a CALL of the given export; returns its seq. */
 static uint8_t fk_expect_call(int fd, const char *name)
 {
@@ -264,21 +277,100 @@ static void *fake_wait(void *arg)
 
 /* Async scenario: answer CALL slow with one MEM_ADD mid-call, then a
  * RESULT — with delays, so the coordinator's poll loop actually spins. */
+/*
+ * A node running two instances at once. It takes a call on each, answers
+ * the second while the first is still working, and only then issues the
+ * first one's remote-memory RPC and completes it — so the coordinator has
+ * to cope with responses arriving in the opposite order to the requests,
+ * which is exactly what a node whose instances run concurrently does.
+ */
 static void *fake_async(void *arg)
 {
 	int fd = (int)(intptr_t)arg;
 	uint8_t nseq = 0x30, rtype, rbuf[64], req[8];
 	uint32_t rlen;
-	uint8_t call_seq = fk_expect_call(fd, "slow");
+	uint8_t slow_inst = 0, fast_inst = 0;
+	uint8_t slow_seq = fk_expect_call_inst(fd, "slow", &slow_inst);
+	uint8_t fast_seq = fk_expect_call_inst(fd, "fast", &fast_inst);
 
-	usleep(100 * 1000);
+	/* The second call finishes first. */
+	usleep(20 * 1000);
+	fk_result_i32(fd, fast_seq, 11);
+
+	/* Now the first one's remote access, then its result. */
+	usleep(50 * 1000);
 	le32(req, wasp_pack_ref(1, 32));
 	le32(req + 4, 9);
 	fk_rpc(fd, &nseq, WASP_MSG_MEM_ADD, req, 8, &rtype, rbuf, sizeof(rbuf),
 	       &rlen);
 	assert(rtype == WASP_MSG_MEM_DATA);
-	usleep(50 * 1000);
-	fk_result_i32(fd, call_seq, 7);
+	usleep(20 * 1000);
+	fk_result_i32(fd, slow_seq, 7);
+	close(fd);
+	return NULL;
+}
+
+/* A node answering the synchronous instance API. */
+static void *fake_instances(void *arg)
+{
+	int fd = (int)(intptr_t)arg;
+	uint8_t type, seq, buf[512];
+	uint32_t len;
+	uint8_t reply[16];
+
+	/* MODULE_UPLOAD [n_inst][.wasm] -> [mod][n][inst x n] */
+	assert(fk_recv(fd, &type, &seq, buf, sizeof(buf), &len) == 0);
+	assert(type == WASP_MSG_MODULE_UPLOAD);
+	assert(buf[0] == 2);              /* asked for two instances */
+	assert(len == 1 + 4);             /* one byte of count + 4 of "wasm" */
+	reply[0] = WASP_HANDLE(0, 0);     /* module 0, generation 0 */
+	reply[1] = 2;
+	reply[2] = WASP_HANDLE(0, 0);
+	reply[3] = WASP_HANDLE(1, 0);
+	wasp_send_frame(fd, WASP_MSG_RESULT, seq, reply, 4);
+
+	/* INSTANTIATE [mod][count] -> [count][inst x count] */
+	assert(fk_recv(fd, &type, &seq, buf, sizeof(buf), &len) == 0);
+	assert(type == WASP_MSG_INSTANTIATE && len == 2);
+	assert(buf[0] == WASP_HANDLE(0, 0) && buf[1] == 1);
+	reply[0] = 1;
+	reply[1] = WASP_HANDLE(2, 3); /* slot 2, third generation */
+	wasp_send_frame(fd, WASP_MSG_RESULT, seq, reply, 2);
+
+	/* CALL_INST on that handle */
+	{
+		uint8_t inst = 0;
+
+		seq = fk_expect_call_inst(fd, "add", &inst);
+		assert(inst == WASP_HANDLE(2, 3));
+		fk_result_i32(fd, seq, 42);
+	}
+
+	/* INVENTORY -> capacity plus what is resident */
+	assert(fk_recv(fd, &type, &seq, buf, sizeof(buf), &len) == 0);
+	assert(type == WASP_MSG_INVENTORY);
+	reply[0] = 3;                 /* slots_total */
+	reply[1] = 1;                 /* slots_free */
+	le32(reply + 2, 0x30000);     /* pool_free */
+	reply[6] = 1;                 /* one module */
+	reply[7] = WASP_HANDLE(0, 0);
+	reply[8] = 2;
+	reply[9] = WASP_HANDLE(0, 0);
+	reply[10] = WASP_HANDLE(1, 0);
+	wasp_send_frame(fd, WASP_MSG_RESULT, seq, reply, 11);
+
+	/* DROP a stale handle -> BAD_HANDLE */
+	assert(fk_recv(fd, &type, &seq, buf, sizeof(buf), &len) == 0);
+	assert(type == WASP_MSG_DROP && len == 2);
+	assert(buf[0] == WASP_DROP_INSTANCE);
+	reply[0] = WASP_ERR_BAD_HANDLE;
+	wasp_send_frame(fd, WASP_MSG_ERROR, seq, reply, 1);
+
+	/* DROP the module -> empty RESULT */
+	assert(fk_recv(fd, &type, &seq, buf, sizeof(buf), &len) == 0);
+	assert(type == WASP_MSG_DROP && buf[0] == WASP_DROP_MODULE);
+	wasp_send_frame(fd, WASP_MSG_RESULT, seq, NULL, 0);
+
 	close(fd);
 	return NULL;
 }
@@ -421,28 +513,87 @@ int main(void)
 	assert(nc && fdc >= 0);
 	pthread_create(&fkc, NULL, fake_async, (void *)(intptr_t)fdc);
 	le32(region1 + 32, 100);
-	CHECK(wasp_call_async(nc, "slow", NULL, 0) == WASP_OK,
-	      "async call sent");
-	CHECK(wasp_call_async(nc, "slow", NULL, 0) == WASP_E_ARG,
-	      "second async call on the slot refused");
+
+	/* Two calls in flight at once, on different instances. The old API
+	 * allowed one per node because the node's executor was
+	 * single-threaded; it no longer is.
+	 */
+	CHECK(wasp_call_inst_async(nc, WASP_HANDLE(0, 0), "slow", NULL, 0) ==
+	      WASP_OK, "async call to instance 0 sent");
+	CHECK(wasp_call_inst_async(nc, WASP_HANDLE(1, 0), "fast", NULL, 0) ==
+	      WASP_OK, "second async call to another instance accepted");
+	CHECK(wasp_call_inflight(nc) == 2, "two calls outstanding");
 
 	int agains = 0;
+	uint8_t done_inst = 0xFF;
 
 	for (;;) {
-		rc = wasp_call_poll(nc, res);
+		rc = wasp_call_poll_any(nc, &done_inst, res);
 		if (rc != WASP_E_AGAIN)
 			break;
 		agains++;
 		usleep(5 * 1000);
 	}
-	CHECK(rc == 1 && res[0] == 7, "async call completed via poll");
-	CHECK(agains > 0, "poll returned E_AGAIN while the call ran");
+	/* The node answered the second call first; poll must report which
+	 * instance completed, not assume an order. */
+	CHECK(rc == 1 && res[0] == 11 && done_inst == WASP_HANDLE(1, 0),
+	      "the instance that finished first completes first");
+	CHECK(agains > 0, "poll returned E_AGAIN while the calls ran");
+	CHECK(wasp_call_inflight(nc) == 1, "the slow call is still outstanding");
+
+	for (;;) {
+		rc = wasp_call_poll_any(nc, &done_inst, res);
+		if (rc != WASP_E_AGAIN)
+			break;
+		usleep(5 * 1000);
+	}
+	CHECK(rc == 1 && res[0] == 7 && done_inst == WASP_HANDLE(0, 0),
+	      "the slow instance completes second");
 	CHECK(region1[32] == 109, "MEM_ADD served from inside the poll loop");
+	CHECK(wasp_call_inflight(nc) == 0, "nothing left outstanding");
 	pthread_join(fkc, NULL);
 	wasp_node_free(nc);
 	/* drain the async scenario's events */
 	while (wasp_poll_event(ctx, &ev, 10) == 1)
 		;
+
+	/* -- synchronous instance API --------------------------------- */
+	wasp_node *nd = wasp_connect(ctx, "127.0.0.1", port, 5000);
+	int fdd = accept(lfd, NULL, NULL);
+	pthread_t fkd;
+	uint8_t mod = 0xFF, insts[WASP_HANDLE_SLOTS], more = 0xFF;
+	wasp_inventory inv;
+
+	assert(nd && fdd >= 0);
+	pthread_create(&fkd, NULL, fake_instances, (void *)(intptr_t)fdd);
+
+	rc = wasp_upload(nd, "wasm", 4, 2, &mod, insts, sizeof(insts));
+	CHECK(rc == 2 && mod == WASP_HANDLE(0, 0), "upload returns two instances");
+	CHECK(insts[0] == WASP_HANDLE(0, 0) && insts[1] == WASP_HANDLE(1, 0),
+	      "both instance handles decoded");
+
+	rc = wasp_instantiate(nd, mod, 1, &more, 1);
+	CHECK(rc == 1 && more == WASP_HANDLE(2, 3),
+	      "instantiate decodes a regenerated handle");
+	CHECK(WASP_HANDLE_IDX(more) == 2 && WASP_HANDLE_GEN(more) == 3,
+	      "handle splits into slot and generation");
+
+	rc = wasp_call_inst(nd, more, "add", NULL, 0, res);
+	CHECK(rc == 1 && res[0] == 42, "call on a named instance");
+
+	CHECK(wasp_inventory_get(nd, &inv) == WASP_OK, "inventory read");
+	CHECK(inv.slots_total == 3 && inv.slots_free == 1 &&
+	      inv.pool_free == 0x30000, "inventory reports capacity");
+	CHECK(inv.n_modules == 1 && inv.modules[0].n_inst == 2,
+	      "inventory lists the module's instances");
+
+	CHECK(wasp_drop_instance(nd, WASP_HANDLE(5, 1)) == -WASP_ERR_BAD_HANDLE,
+	      "a stale handle is refused");
+	CHECK(wasp_drop_module(nd, mod) == WASP_OK, "module dropped");
+
+	pthread_join(fkd, NULL);
+	wasp_node_free(nd);
+
 	close(lfd);
 	wasp_ctx_free(ctx);
 

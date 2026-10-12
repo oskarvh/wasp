@@ -56,9 +56,12 @@ if(CONFIG_WASP_PEER)
     src/peer/peer_api.c
   )
   target_include_directories(app PRIVATE ../libwasp/include ../libwasp/src)
-  # MCU-sized tables: 8 regions (~0.6 KiB) and a 128-entry event queue
-  # (16 B each — the conductor tracks tile provenance through it).
-  target_compile_definitions(app PRIVATE WASP_MAX_REGIONS=8 WASP_EVQ_CAP=128)
+  # MCU-sized tables: 8 regions (~0.6 KiB), a 128-entry event queue
+  # (16 B each — the conductor tracks tile provenance through it), and
+  # in-flight async calls bounded by what a node can actually run at
+  # once (one per instance), since each slot costs ~24 B per node.
+  target_compile_definitions(app PRIVATE WASP_MAX_REGIONS=8 WASP_EVQ_CAP=128
+                             WASP_MAX_INFLIGHT=4)
 endif()
 
 if(CONFIG_WASP_PEER_SMOKE)

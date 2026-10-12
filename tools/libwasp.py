@@ -50,9 +50,27 @@ class _CEvent(ctypes.Structure):
 
 
 class _CInfo(ctypes.Structure):
+    # Mirrors wasp_info in libwasp.h — the capacity tail included, or
+    # ctypes would read the wrong offsets.
     _fields_ = [("ip", ctypes.c_char * 46), ("tcp_port", ctypes.c_uint16),
                 ("version", ctypes.c_uint8), ("features", ctypes.c_uint8),
-                ("busy", ctypes.c_uint8), ("board", ctypes.c_char * 33)]
+                ("busy", ctypes.c_uint8), ("board", ctypes.c_char * 33),
+                ("slots_total", ctypes.c_uint8),
+                ("slots_free", ctypes.c_uint8),
+                ("pool_free", ctypes.c_uint32)]
+
+
+class _CInvModule(ctypes.Structure):
+    _fields_ = [("mod", ctypes.c_uint8), ("n_inst", ctypes.c_uint8),
+                ("inst", ctypes.c_uint8 * 16)]
+
+
+class _CInventory(ctypes.Structure):
+    _fields_ = [("slots_total", ctypes.c_uint8),
+                ("slots_free", ctypes.c_uint8),
+                ("pool_free", ctypes.c_uint32),
+                ("n_modules", ctypes.c_uint8),
+                ("modules", _CInvModule * 16)]
 
 
 def _load_lib():
@@ -94,6 +112,19 @@ def _load_lib():
     sig("wasp_unload", ctypes.c_int, p)
     sig("wasp_call", ctypes.c_int, p, ctypes.c_char_p,
         ctypes.POINTER(ctypes.c_int32), u32, ctypes.POINTER(ctypes.c_int32))
+    sig("wasp_upload", ctypes.c_int, p, ctypes.c_char_p, u32, u8,
+        ctypes.POINTER(u8), ctypes.POINTER(u8), u8)
+    sig("wasp_instantiate", ctypes.c_int, p, u8, u8, ctypes.POINTER(u8), u8)
+    sig("wasp_call_inst", ctypes.c_int, p, u8, ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_int32), u32, ctypes.POINTER(ctypes.c_int32))
+    sig("wasp_drop_instance", ctypes.c_int, p, u8)
+    sig("wasp_drop_module", ctypes.c_int, p, u8)
+    sig("wasp_inventory_get", ctypes.c_int, p, ctypes.POINTER(_CInventory))
+    sig("wasp_call_inst_async", ctypes.c_int, p, u8, ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_int32), u32)
+    sig("wasp_call_poll_any", ctypes.c_int, p, ctypes.POINTER(u8),
+        ctypes.POINTER(ctypes.c_int32))
+    sig("wasp_call_inflight", ctypes.c_int, p)
     sig("wasp_discover", ctypes.c_int, ctypes.POINTER(_CInfo), u32, u32, u16)
     return lib
 
@@ -320,6 +351,80 @@ class WaspNode:
                 f"call {func} failed: {_err_text(rc, self._detail())}")
         return [out[i] for i in range(rc)]
 
+    # -- multi-instance ------------------------------------------------
+    # Names match tools/wasp_client.py so the shared self-tests run
+    # against either implementation unchanged.
+
+    def _check(self, rc: int, what: str) -> int:
+        if rc <= -100:
+            _raise_transport(rc)
+        if rc < 0:
+            raise ValueError(f"{what} failed: {_err_text(rc, self._detail())}")
+        return rc
+
+    def upload(self, wasm: bytes, n_inst: int = 1) -> tuple[int, list[int]]:
+        mod = ctypes.c_uint8()
+        insts = (ctypes.c_uint8 * 16)()
+        n = self._check(
+            _lib.wasp_upload(self._n, wasm, len(wasm), n_inst,
+                             ctypes.byref(mod), insts, 16), "upload")
+        return mod.value, [insts[i] for i in range(n)]
+
+    def instantiate(self, mod: int, count: int = 1) -> list[int]:
+        insts = (ctypes.c_uint8 * 16)()
+        n = self._check(_lib.wasp_instantiate(self._n, mod, count, insts, 16),
+                        "instantiate")
+        return [insts[i] for i in range(n)]
+
+    def call_inst(self, inst: int, func: str, *args: int) -> list[int]:
+        argv = (ctypes.c_int32 * max(1, len(args)))(*args)
+        out = (ctypes.c_int32 * 4)()
+        rc = self._check(
+            _lib.wasp_call_inst(self._n, inst, func.encode(), argv,
+                                len(args), out), f"call {func}")
+        return [out[i] for i in range(rc)]
+
+    def drop_instance(self, inst: int):
+        self._check(_lib.wasp_drop_instance(self._n, inst), "drop instance")
+
+    def drop_module(self, mod: int):
+        self._check(_lib.wasp_drop_module(self._n, mod), "drop module")
+
+    def inventory(self) -> dict:
+        inv = _CInventory()
+        self._check(_lib.wasp_inventory_get(self._n, ctypes.byref(inv)),
+                    "inventory")
+        return {
+            "slots_total": inv.slots_total,
+            "slots_free": inv.slots_free,
+            "pool_free": inv.pool_free,
+            "modules": [
+                {"mod": inv.modules[i].mod,
+                 "instances": [inv.modules[i].inst[j]
+                               for j in range(inv.modules[i].n_inst)]}
+                for i in range(inv.n_modules)
+            ],
+        }
+
+    def call_inst_async(self, inst: int, func: str, *args: int):
+        argv = (ctypes.c_int32 * max(1, len(args)))(*args)
+        self._check(
+            _lib.wasp_call_inst_async(self._n, inst, func.encode(), argv,
+                                      len(args)), f"async call {func}")
+
+    def call_poll_any(self):
+        """(instance, results) for whichever call finished, or None."""
+        inst = ctypes.c_uint8()
+        out = (ctypes.c_int32 * 4)()
+        rc = _lib.wasp_call_poll_any(self._n, ctypes.byref(inst), out)
+        if rc == -107:  # WASP_E_AGAIN
+            return None
+        rc = self._check(rc, "poll")
+        return inst.value, [out[i] for i in range(rc)]
+
+    def inflight(self) -> int:
+        return _lib.wasp_call_inflight(self._n)
+
 
 def discover(timeout: float = 6.0, port: int = ANNOUNCE_PORT) -> dict[str, dict]:
     """Listen for ANNOUNCE broadcasts; returns {ip: node info}."""
@@ -334,6 +439,9 @@ def discover(timeout: float = 6.0, port: int = ANNOUNCE_PORT) -> dict[str, dict]
             "port": infos[i].tcp_port,
             "busy": bool(infos[i].busy),
             "board": infos[i].board.decode(errors="replace"),
+            "slots_total": infos[i].slots_total,
+            "slots_free": infos[i].slots_free,
+            "pool_free": infos[i].pool_free,
         }
         for i in range(n)
     }

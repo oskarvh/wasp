@@ -24,6 +24,12 @@
 #ifndef WASP_EVQ_CAP
 #define WASP_EVQ_CAP 8192
 #endif
+/*   WASP_MAX_INFLIGHT  concurrent async calls per node (~24 B each). A
+ *                      node executes one call per instance at a time, so
+ *                      there is no point exceeding its instance count. */
+#ifndef WASP_MAX_INFLIGHT
+#define WASP_MAX_INFLIGHT 8
+#endif
 /* Default rx buffer for the malloc-based wasp_connect (POSIX). */
 #ifndef WASP_RX_CAP_DEFAULT
 #define WASP_RX_CAP_DEFAULT (128 * 1024)
@@ -93,9 +99,27 @@ struct wasp_node {
 	uint32_t rx_cap;
 	char detail[WASP_DETAIL_MAX];
 
-	/* The async slot: one outstanding wasp_call_async per node. */
-	int call_pending;
-	uint8_t call_seq;
+	/*
+	 * Outstanding async calls. There used to be exactly one, on the
+	 * grounds that the node's executor was single-threaded; it now runs
+	 * a thread per instance, so several calls to different instances
+	 * really do proceed at once and the coordinator has to be able to
+	 * have several in flight to use that.
+	 *
+	 * A response is parsed into its slot the moment it arrives, rather
+	 * than left in n->rx for the poller to read later: rx holds one
+	 * frame, and with several calls outstanding the next frame would
+	 * overwrite it before anyone harvested the result.
+	 */
+	struct wasp_call_slot {
+		int in_use; /* sent, not yet harvested */
+		int done;   /* response parsed into rc/results */
+		int rc;     /* wasp_call's return convention */
+		uint8_t seq;
+		uint8_t inst;
+		int has_inst; /* CALL_INST rather than the v1 CALL */
+		int32_t results[WASP_CALL_MAX_RESULTS];
+	} calls[WASP_MAX_INFLIGHT];
 };
 
 /*
