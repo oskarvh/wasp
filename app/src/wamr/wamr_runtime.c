@@ -43,6 +43,7 @@
 
 #include "wasm_export.h"
 
+#include "inst_ctx.h"
 #include "wamr_runtime.h"
 #include "wasp.h"
 
@@ -98,12 +99,12 @@ struct inst_slot {
 	bool used;
 	bool running;
 	/*
-	 * Which coordinator connection this instance's call came in on.
-	 * Reached from the host functions through
-	 * wasm_runtime_get_user_data(exec_env) — it used to be one global,
+	 * Connection to answer on, plus this instance's counters. Reached
+	 * from the host functions through
+	 * wasm_runtime_get_user_data(exec_env) — conn used to be one global,
 	 * which was correct only while a single thread could be mid-call.
 	 */
-	uint8_t conn;
+	struct wasp_inst_ctx ctx;
 };
 
 static struct mod_slot mods[NSLOTS];
@@ -354,12 +355,14 @@ static int instantiate_locked(uint8_t mod_idx, char *err, size_t errlen)
 	}
 
 	/*
-	 * The host functions reach the connection to answer on through the
-	 * exec_env rather than a global. Point at the field, not the slot:
-	 * native_remote.c then needs no knowledge of this struct's layout.
+	 * The host functions reach the connection to answer on, and their
+	 * own counters, through the exec_env rather than a global. Point at
+	 * the context, not the slot, so native_remote.c needs no knowledge
+	 * of this struct's layout.
 	 */
-	wasm_runtime_set_user_data(s->exec_env, &s->conn);
+	wasm_runtime_set_user_data(s->exec_env, &s->ctx);
 
+	memset(&s->ctx, 0, sizeof(s->ctx));
 	s->mod_idx = mod_idx;
 	s->used = true;
 	s->running = false;
@@ -588,6 +591,50 @@ static void handle_drop(struct wasp_msg *msg)
 	wasp_queue_tx(msg, WASP_MSG_RESULT, NULL, 0);
 }
 
+/*
+ * STATS: per-instance time and traffic. [reset u8] clears afterwards, so a
+ * caller can bracket a run rather than subtract two absolute readings.
+ */
+static void handle_stats(const struct wasp_msg *msg)
+{
+	uint8_t reply[1 + NSLOTS * 29];
+	bool reset = (msg->len >= 1 && msg->payload[0] != 0);
+	uint32_t n = 1;
+	uint8_t count = 0;
+
+	k_mutex_lock(&table_lock, K_FOREVER);
+	for (int i = 0; i < NSLOTS; i++) {
+		struct inst_slot *s = &insts[i];
+
+		if (!s->used) {
+			continue;
+		}
+		reply[n++] = inst_handle(s);
+		sys_put_le32(s->ctx.calls, &reply[n]);           n += 4;
+		sys_put_le32(s->ctx.traps, &reply[n]);           n += 4;
+		/* ns -> us on the way out; see protocol.h on the range. */
+		sys_put_le32((uint32_t)(s->ctx.exec_ns / 1000U), &reply[n]);
+		n += 4;
+		sys_put_le32(s->ctx.rpc_count, &reply[n]);       n += 4;
+		sys_put_le32((uint32_t)(s->ctx.rpc_wait_ns / 1000U), &reply[n]);
+		n += 4;
+		sys_put_le32(s->ctx.rpc_tx, &reply[n]);          n += 4;
+		sys_put_le32(s->ctx.rpc_rx, &reply[n]);          n += 4;
+		count++;
+
+		if (reset) {
+			uint8_t conn = s->ctx.conn;
+
+			memset(&s->ctx, 0, sizeof(s->ctx));
+			s->ctx.conn = conn; /* not a statistic */
+		}
+	}
+	k_mutex_unlock(&table_lock);
+	reply[0] = count;
+
+	wasp_queue_tx(msg, WASP_MSG_RESULT, reply, n);
+}
+
 /* INVENTORY: what is resident and what room is left. */
 static void handle_inventory(const struct wasp_msg *msg)
 {
@@ -685,7 +732,7 @@ static void handle_call(const struct wasp_msg *msg, bool with_handle)
 		return;
 	}
 	slot->running = true;
-	slot->conn = msg->conn;
+	slot->ctx.conn = msg->conn;
 	k_mutex_unlock(&table_lock);
 
 	/* -- parse -- */
@@ -753,13 +800,30 @@ static void handle_call(const struct wasp_msg *msg, bool with_handle)
 	}
 
 	/* -- execute -- */
-	if (!wasm_runtime_call_wasm(slot->exec_env, func, argc, cells)) {
+	uint32_t t0 = k_cycle_get_32();
+	bool ok = wasm_runtime_call_wasm(slot->exec_env, func, argc, cells);
+
+	/*
+	 * Wall time inside the interpreter, RPC waits included —
+	 * subtracting ctx.rpc_wait_ns from this is what separates compute
+	 * from transmission.
+	 *
+	 * Caveat: k_cycle_get_32 wraps every ~7.8 s at 550 MHz, so a single
+	 * call lasting longer than that is undercounted. Calls here are
+	 * milliseconds; a module that deliberately ran for minutes inside
+	 * one CALL would need a 64-bit cycle counter.
+	 */
+	slot->ctx.exec_ns += k_cyc_to_ns_floor64(k_cycle_get_32() - t0);
+	slot->ctx.calls++;
+
+	if (!ok) {
 		const char *exception = wasm_runtime_get_exception(slot->inst);
 
 		LOG_WRN("call %s trapped: %s", name, exception ? exception : "?");
 		release(slot);
 		wasp_queue_error(msg, WASP_ERR_TRAP, exception);
 		wasm_runtime_clear_exception(slot->inst);
+		slot->ctx.traps++;
 		release(slot);
 		return;
 	}
@@ -888,6 +952,9 @@ static void exec_thread_fn(void *a, void *b, void *c)
 			break;
 		case WASP_MSG_INVENTORY:
 			handle_inventory(&msg);
+			break;
+		case WASP_MSG_STATS:
+			handle_stats(&msg);
 			break;
 		case WASP_MSG_CALL:
 			handle_call(&msg, false);

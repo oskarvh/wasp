@@ -95,6 +95,7 @@ static void handle_msg(struct wasp_msg *msg)
 	case WASP_MSG_CALL_INST:
 	case WASP_MSG_DROP:
 	case WASP_MSG_INVENTORY:
+	case WASP_MSG_STATS:
 		/* Hand the whole message (payload ownership included) to the
 		 * executor; it answers the coordinator itself. */
 		if (k_msgq_put(&wasp_exec_q, msg, K_MSEC(100)) != 0) {

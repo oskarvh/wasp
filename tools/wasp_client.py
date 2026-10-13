@@ -48,6 +48,7 @@ INSTANTIATE = 0x0E
 CALL_INST = 0x0F
 DROP = 0x10
 INVENTORY = 0x11
+STATS = 0x12
 MEM_READ = 0x40
 MEM_DATA = 0x41
 MEM_WRITE = 0x42
@@ -496,6 +497,31 @@ class WaspNode:
         if t != RESULT:
             raise ValueError(f"drop module failed: {err_name(payload)}")
 
+    def stats(self, reset: bool = False) -> list[dict]:
+        """Per-instance time and traffic counters from the node.
+
+        rpc_wait_us accrues *inside* exec_us, so the split is
+        compute = exec - wait. Pass reset=True to zero them after
+        reading, which is how you bracket a single run instead of
+        differencing two absolute readings.
+        """
+        t, _, p = self.request(STATS, bytes([1 if reset else 0]))
+        if t != RESULT:
+            raise ValueError(f"stats failed: {err_name(p)}")
+        out, at = [], 1
+        for _ in range(p[0]):
+            inst = p[at]
+            (calls, traps, exec_us, rpc_count,
+             rpc_wait_us, rpc_tx, rpc_rx) = struct.unpack_from("<7I", p, at + 1)
+            at += 29
+            out.append({
+                "inst": inst, "calls": calls, "traps": traps,
+                "exec_us": exec_us, "rpc_count": rpc_count,
+                "rpc_wait_us": rpc_wait_us, "rpc_tx": rpc_tx, "rpc_rx": rpc_rx,
+                "compute_us": max(0, exec_us - rpc_wait_us),
+            })
+        return out
+
     def reset(self):
         """Release everything resident, whatever shape it is in.
 
@@ -917,6 +943,36 @@ def cmd_concurrency(node: WaspNode, args):
     print("all concurrency checks passed")
 
 
+def print_stats(rows: list[dict], label: str = ""):
+    """Render the per-instance breakdown as a table."""
+    if not rows:
+        print(f"{label}no instances resident")
+        return
+    print(f"{label}{'inst':>5} {'calls':>6} {'exec':>9} {'compute':>9} "
+          f"{'waiting':>9} {'wait%':>6} {'RPCs':>6} {'tx+rx':>9}")
+    tot = {k: 0 for k in ("calls", "exec_us", "compute_us", "rpc_wait_us",
+                          "rpc_count", "rpc_tx", "rpc_rx")}
+    for r in rows:
+        pct = (100.0 * r["rpc_wait_us"] / r["exec_us"]) if r["exec_us"] else 0.0
+        print(f"{label}{r['inst']:>5} {r['calls']:>6} "
+              f"{r['exec_us'] / 1000:>8.1f}m {r['compute_us'] / 1000:>8.1f}m "
+              f"{r['rpc_wait_us'] / 1000:>8.1f}m {pct:>5.1f}% "
+              f"{r['rpc_count']:>6} {r['rpc_tx'] + r['rpc_rx']:>8}B")
+        for k in tot:
+            tot[k] += r[k]
+    if len(rows) > 1:
+        pct = (100.0 * tot["rpc_wait_us"] / tot["exec_us"]) if tot["exec_us"] else 0.0
+        print(f"{label}{'all':>5} {tot['calls']:>6} "
+              f"{tot['exec_us'] / 1000:>8.1f}m {tot['compute_us'] / 1000:>8.1f}m "
+              f"{tot['rpc_wait_us'] / 1000:>8.1f}m {pct:>5.1f}% "
+              f"{tot['rpc_count']:>6} {tot['rpc_tx'] + tot['rpc_rx']:>8}B")
+
+
+def cmd_stats(node: WaspNode, args):
+    node.hello()
+    print_stats(node.stats(reset=args.reset))
+
+
 def cmd_reset(node: WaspNode, args):
     node.hello()
     node.reset()
@@ -1021,6 +1077,9 @@ def main():
     p = sub.add_parser("instances", help="multi-instance self-test")
     p.add_argument("module", help=".wasm exporting add(i32,i32)")
     p.add_argument("module2", nargs="?", help="a second, different .wasm")
+    p = sub.add_parser("stats", help="per-instance compute vs network time")
+    p.add_argument("--reset", action="store_true",
+                   help="zero the counters after reading")
     sub.add_parser("reset", help="release every module/instance on the node")
     p = sub.add_parser("load", help="load a module")
     p.add_argument("module", help="path to .wasm file")
@@ -1042,6 +1101,7 @@ def main():
     handlers = {"check": cmd_check, "lifecycle": cmd_lifecycle, "remote": cmd_remote,
                 "remote2": cmd_remote2, "instances": cmd_instances,
                 "concurrency": cmd_concurrency, "reset": cmd_reset,
+                "stats": cmd_stats,
                 "load": cmd_load, "unload": cmd_unload,
                 "call": cmd_call, "identify": cmd_identify, "reboot": cmd_reboot,
                 None: cmd_check}

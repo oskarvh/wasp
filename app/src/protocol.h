@@ -33,6 +33,25 @@
  *   DROP          (c->n): [kind u8][handle u8]
  *                         kind 0 = instance, 1 = module (and its instances)
  *                 (n->c): RESULT, empty
+ *   STATS         (c->n): [reset u8: non-zero clears the counters after
+ *                         reporting]
+ *                 (n->c): RESULT [n u8][{inst u8, calls u32, traps u32,
+ *                         exec_us u32, rpc_count u32, rpc_wait_us u32,
+ *                         rpc_tx u32, rpc_rx u32} x n]  (all LE)
+ *
+ * STATS is per instance because that is the grain the interesting
+ * question has: how much of a call went into the interpreter and how much
+ * into waiting for the coordinator. Instances of one node interleave
+ * precisely so one computes while another waits, so a node-wide total
+ * hides it. rpc_wait_us is accrued *inside* exec_us, which is what makes
+ * the split arithmetic work:
+ *
+ *     compute  = exec_us - rpc_wait_us
+ *     waiting  = rpc_wait_us / exec_us
+ *
+ * Microseconds, not nanoseconds, so a u32 covers ~71 minutes of
+ * accumulated time per counter.
+ *
  *   INVENTORY     (c->n): empty
  *                 (n->c): RESULT [slots_total u8][slots_free u8]
  *                         [pool_free u32 LE][n_mod u8]
@@ -152,6 +171,7 @@ enum wasp_msg_type {
 	WASP_MSG_CALL_INST = 0x0F,
 	WASP_MSG_DROP = 0x10,
 	WASP_MSG_INVENTORY = 0x11,
+	WASP_MSG_STATS = 0x12,
 
 	/* 0x4x: node-initiated remote-memory traffic (node's seq space). */
 	WASP_MSG_MEM_READ = 0x40,
