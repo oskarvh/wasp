@@ -802,6 +802,29 @@ def cmd_instances(node: WaspNode, args):
     check("v1 unload still works",
           expect_error(node, CALL, WaspNode._call_payload("add", (1, 1)), "NO_MODULE"))
 
+    # Dropping a module out from under the v1 default instance. This used
+    # to wedge a node for good: the node kept a "a default is loaded"
+    # flag that only v1 UNLOAD_MODULE cleared, so after a DROP the flag
+    # pointed at a retired handle — v1 load answered BUSY because a
+    # default was supposedly loaded, while call and unload answered
+    # NO_MODULE because the handle no longer resolved. Nothing but a
+    # reboot recovered it, and `reset` would put a node into that state
+    # because it clears up via DROP.
+    node.load(wasm_a)
+    mods = [m["mod"] for m in node.inventory()["modules"]]
+    check("v1 load registers a module", len(mods) == 1, f"module {mods}")
+    node.drop_module(mods[0])
+    try:
+        node.load(wasm_a)
+        reloaded = True
+    except ValueError as e:
+        reloaded = False
+        detail = str(e)
+    check("v1 load works after its module was DROPped", reloaded,
+          "" if reloaded else detail)
+    check("and the reloaded module runs", node.call("add", 2, 3) == [5])
+    node.unload()
+
     print("all multi-instance checks passed")
 
 
