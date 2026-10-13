@@ -954,7 +954,8 @@ def print_stats(rows: list[dict], label: str = ""):
                           "rpc_count", "rpc_tx", "rpc_rx")}
     for r in rows:
         pct = (100.0 * r["rpc_wait_us"] / r["exec_us"]) if r["exec_us"] else 0.0
-        print(f"{label}{r['inst']:>5} {r['calls']:>6} "
+        name = "gone" if r["inst"] == 0xFF else str(r["inst"])
+        print(f"{label}{name:>5} {r['calls']:>6} "
               f"{r['exec_us'] / 1000:>8.1f}m {r['compute_us'] / 1000:>8.1f}m "
               f"{r['rpc_wait_us'] / 1000:>8.1f}m {pct:>5.1f}% "
               f"{r['rpc_count']:>6} {r['rpc_tx'] + r['rpc_rx']:>8}B")

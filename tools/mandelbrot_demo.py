@@ -43,6 +43,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from libwasp import (WaspNode, discover, pack_ref, default_ctx,
                      EV_MEM_WRITE, FEAT_MULTI_INSTANCE)
+from wasp_client import print_stats
 
 PARAMS_REGION, CTR_REGION, FB_REGION = 1, 2, 3
 Q = 1 << 28  # Q4.28
@@ -317,6 +318,9 @@ def parse_args():
     ap.add_argument("--instances", type=int, default=0,
                    help="worker instances per node (0 = every free slot; "
                         "1 = one, as before)")
+    ap.add_argument("--stats", action="store_true",
+                   help="per-instance compute vs network breakdown from "
+                        "each node, read before the modules are released")
     ap.add_argument("--no-live", action="store_true")
     ap.add_argument("--gif", action="store_true")
     ap.add_argument("--chaos", action="store_true")
@@ -449,6 +453,13 @@ def main():
           f"{len(nodes)} node(s), {sum(workers_per_node)} worker(s) "
           f"{workers_per_node}")
 
+    if args.stats:
+        for node in nodes:
+            try:
+                node.stats(reset=True)   # bracket this run
+            except Exception:            # noqa: BLE001 — older firmware
+                args.stats = False
+
     demo.t0 = time.monotonic()
     rec = (GifRecorder(f"{args.out}.gif", demo.w, demo.h, demo.max_iter)
            if args.gif else None)
@@ -529,6 +540,19 @@ def main():
     pump_thread.join()
 
     dt = time.monotonic() - demo.t0
+    if args.stats:
+        # Before teardown, not after: dropping a module destroys its
+        # instances, and the counters live on the instance.
+        print()
+        for node in alive:
+            try:
+                rows = node.stats()
+            except Exception as e:  # noqa: BLE001
+                print(f"  {node.lock_owner}: stats unavailable ({e})")
+                continue
+            print(f"  {node.lock_owner}")
+            print_stats(rows, "    ")
+
     for node in alive:
         try:
             # Release the right thing: unload() addresses the single v1

@@ -15,6 +15,7 @@ use). Differences from the pure-Python client:
 """
 
 import ctypes
+import struct
 import subprocess
 import time
 from collections import namedtuple
@@ -396,6 +397,30 @@ class WaspNode:
 
     def drop_module(self, mod: int):
         self._check(_lib.wasp_drop_module(self._n, mod), "drop module")
+
+    def stats(self, reset: bool = False) -> list[dict]:
+        """Per-instance time and traffic counters from the node.
+
+        Built on request() rather than a C entry point: the parsing is a
+        handful of little-endian words and the conductor has no use for
+        it yet, so there is nothing for libwasp proper to carry.
+        """
+        t, _, p = self.request(0x12, bytes([1 if reset else 0]))  # STATS
+        if t != 0x06:  # RESULT
+            raise ValueError("stats failed")
+        out, at = [], 1
+        for _ in range(p[0]):
+            inst = p[at]
+            (calls, traps, exec_us, rpc_count,
+             rpc_wait_us, rpc_tx, rpc_rx) = struct.unpack_from("<7I", p, at + 1)
+            at += 29
+            out.append({
+                "inst": inst, "calls": calls, "traps": traps,
+                "exec_us": exec_us, "rpc_count": rpc_count,
+                "rpc_wait_us": rpc_wait_us, "rpc_tx": rpc_tx, "rpc_rx": rpc_rx,
+                "compute_us": max(0, exec_us - rpc_wait_us),
+            })
+        return out
 
     def reset(self):
         """Release everything resident, whatever shape it is in.

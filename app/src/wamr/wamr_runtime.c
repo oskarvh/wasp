@@ -253,6 +253,30 @@ uint32_t wasp_wamr_pool_free(void)
 static uint8_t default_inst;
 static bool default_valid;
 
+/*
+ * Counters of instances that no longer exist.
+ *
+ * The counters live on the instance, so dropping a module took its
+ * measurements with it — and dropping the module is the last thing any
+ * well-behaved client does, which made "run a workload, then ask what
+ * happened" return nothing at all. Folding them in here keeps the totals
+ * answerable after the fact; STATS reports them under handle 0xFF, which
+ * can never name a real instance because the table is far smaller than
+ * the sixteen slots a handle's index field could address.
+ */
+static struct wasp_inst_ctx retired;
+
+static void fold_into_retired(const struct wasp_inst_ctx *c)
+{
+	retired.calls += c->calls;
+	retired.traps += c->traps;
+	retired.exec_ns += c->exec_ns;
+	retired.rpc_count += c->rpc_count;
+	retired.rpc_wait_ns += c->rpc_wait_ns;
+	retired.rpc_tx += c->rpc_tx;
+	retired.rpc_rx += c->rpc_rx;
+}
+
 static void drop_instance_locked(struct inst_slot *s)
 {
 	struct mod_slot *m = &mods[s->mod_idx];
@@ -280,6 +304,7 @@ static void drop_instance_locked(struct inst_slot *s)
 	if (s->inst != NULL) {
 		wasm_runtime_deinstantiate(s->inst);
 	}
+	fold_into_retired(&s->ctx);
 	s->inst = NULL;
 	s->exec_env = NULL;
 	s->running = false;
@@ -597,7 +622,7 @@ static void handle_drop(struct wasp_msg *msg)
  */
 static void handle_stats(const struct wasp_msg *msg)
 {
-	uint8_t reply[1 + NSLOTS * 29];
+	uint8_t reply[1 + (NSLOTS + 1) * 29];
 	bool reset = (msg->len >= 1 && msg->payload[0] != 0);
 	uint32_t n = 1;
 	uint8_t count = 0;
@@ -629,6 +654,23 @@ static void handle_stats(const struct wasp_msg *msg)
 			s->ctx.conn = conn; /* not a statistic */
 		}
 	}
+
+	/* Always last, always present: a caller can then report totals
+	 * without having to care whether the instances still exist.
+	 */
+	reply[n++] = 0xFF;
+	sys_put_le32(retired.calls, &reply[n]);     n += 4;
+	sys_put_le32(retired.traps, &reply[n]);     n += 4;
+	sys_put_le32((uint32_t)(retired.exec_ns / 1000U), &reply[n]);     n += 4;
+	sys_put_le32(retired.rpc_count, &reply[n]); n += 4;
+	sys_put_le32((uint32_t)(retired.rpc_wait_ns / 1000U), &reply[n]); n += 4;
+	sys_put_le32(retired.rpc_tx, &reply[n]);    n += 4;
+	sys_put_le32(retired.rpc_rx, &reply[n]);    n += 4;
+	count++;
+	if (reset) {
+		memset(&retired, 0, sizeof(retired));
+	}
+
 	k_mutex_unlock(&table_lock);
 	reply[0] = count;
 

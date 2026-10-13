@@ -52,6 +52,13 @@
  * Microseconds, not nanoseconds, so a u32 covers ~71 minutes of
  * accumulated time per counter.
  *
+ * The last row always carries inst = 0xFF: the totals of instances that
+ * have since been dropped. Without it, "run a workload then ask what
+ * happened" reports nothing, because the counters live on the instance
+ * and releasing the module is the last thing a client does. 0xFF can
+ * never name a live instance, the table being far smaller than the
+ * sixteen slots a handle's index field could address.
+ *
  *   INVENTORY     (c->n): empty
  *                 (n->c): RESULT [slots_total u8][slots_free u8]
  *                         [pool_free u32 LE][n_mod u8]
