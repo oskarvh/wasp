@@ -689,6 +689,82 @@ and the source of a thousand reverse-polarity stories. The
 reverse-polarity FET stays in either case — XT30 pigtails are made by
 humans.
 
+### v1 erratum: the USB data pair never reaches the MCU
+
+**USB power works on the v1 board; USB data cannot.** Two independent
+wiring faults, both in the stretch between J7 and the MCU, both of the
+same kind — a part whose pins were assigned as though its internal
+topology were something else. Neither is a layout or a fabrication
+problem; the copper faithfully implements the schematic.
+
+**U2, the USBLC6-2SC6 ESD array.** Its six pins are four nodes, not six:
+pins 1 and 6 are both `I/O1`, pins 3 and 4 are both `I/O2`, with pin 2
+GND and pin 5 VBUS. It is a *shunt* protector — a line is tapped off one
+of a pair's pins and the diodes clamp it — so the two pins of a pair are
+internally the same wire. The schematic instead treats 1/6 as one side of
+the device and 3/4 as the other, and assigns:
+
+| pin | node | net | consequence |
+| --- | --- | --- | --- |
+| 1 | I/O1 | `USB_EMI_D_P` | shorts the MCU-side pair |
+| 6 | I/O1 | `USB_EMI_D_N` | " |
+| 3 | I/O2 | `USB_CONN_D_N` | shorts the connector-side pair |
+| 4 | I/O2 | `USB_CONN_D_P` | " |
+
+So D+ is shorted to D− at the connector, D+ is shorted to D− at the MCU,
+and there is no path at all between the two halves. ERC cannot see it:
+each pin is a distinct schematic pin, and the short exists only inside
+the package.
+
+**FL1, the common-mode choke.** Mounted with a Pulse `PH9455x105NL`
+symbol against an `ACM2012_TDK` footprint for a TDK ACM2012-361-2P. Both
+the symbol's pin geometry and the footprint's pad geometry put pins 1 and
+2 on one side and **4 top, 3 bottom** on the other — so the windings are
+1↔4 and 2↔3. The nets are assigned as if they were 1↔3 and 2↔4:
+
+| winding | carries |
+| --- | --- |
+| pads 1↔4 | `USB_EMI_D_P` → `USB_D_N` |
+| pads 2↔3 | `USB_EMI_D_N` → `USB_D_P` |
+
+That crosses D+ and D−. The unusual 1,2 / 4,3 numbering is the whole
+trap, and a substituted symbol is exactly where it bites.
+
+Everything either side of those two is correct: J7 ties A6/B6 to D+ and
+A7/B7 to D− so the cable works in both orientations, R1/R2 are the 5.1k
+CC pull-downs, and PA11/PA12 carry DM/DP the right way round.
+
+**Rework, two jumpers and no trace cutting.** The faults cancel, which
+makes the fix much tidier than it has any right to be. U2 has to come off
+regardless — mounted, it shorts the pair. With it removed, jumper *across
+its own footprint*, deliberately crossed:
+
+- U2 pad 4 → pad 6 (hop over pad 5, VBUS)
+- U2 pad 3 → pad 1 (hop over pad 2, GND)
+
+Then D+ runs J7 → `CONN_D_P` → pad4 → pad6 → `EMI_D_N` → FL1 pad2 → pad3
+→ `USB_D_P` → PA12, and D− runs J7 → `CONN_D_N` → pad3 → pad1 →
+`EMI_D_P` → FL1 pad1 → pad4 → `USB_D_N` → PA11. Both correct, and FL1's
+crossing is what cancels the crossing the jumpers introduce, so the
+common-mode choke stays in circuit. Only the ESD protection is lost,
+which is acceptable on a bench board.
+
+Both jumpers run between two pins on the same side of a SOT-23-6, hopping
+one pad, so neither crosses the other.
+
+**V2 fixes:** give U2 pins 1 and 6 the same net (D+) and pins 3 and 4 the
+same net (D−), and give FL1 a symbol whose pin numbering matches the
+ACM2012 footprint — or a footprint matching the Pulse symbol. The
+underlying lesson is the one already recorded for the PSRAM: a
+substituted symbol and footprint have to be checked pin by pin against
+the real part, because ERC and DRC both pass regardless.
+
+A cheap mechanical check for this class of fault, which found both of
+these, is to group every footprint's pads by the symbol's own pin-function
+name and flag any group spanning more than one net. On this board it
+returns U2's two shorts plus one false positive — the MCU's VCAP1/VCAP2,
+internally tied but correctly given a decoupling cap each.
+
 ### USB: power, console, and flashing
 
 The connector is going in for power anyway, so it carries data too.
