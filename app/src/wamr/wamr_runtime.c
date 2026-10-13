@@ -245,9 +245,33 @@ uint32_t wasp_wamr_pool_free(void)
 /* Caller holds table_lock. Tears down an instance and releases its
  * module reference, unloading the module once nothing refers to it.
  */
+/* The v1 LOAD_MODULE/CALL/UNLOAD_MODULE trio addresses one implicit
+ * instance. Declared here because drop_instance_locked has to invalidate
+ * it: see the comment there.
+ */
+static uint8_t default_inst;
+static bool default_valid;
+
 static void drop_instance_locked(struct inst_slot *s)
 {
 	struct mod_slot *m = &mods[s->mod_idx];
+
+	/*
+	 * If this was the v1 default instance, forget it. Leaving the flag
+	 * set while the slot is retired wedges the node: a v1 LOAD_MODULE
+	 * answers BUSY because a default is supposedly loaded, while CALL
+	 * and UNLOAD_MODULE answer NO_MODULE because the handle no longer
+	 * resolves — and nothing short of a reboot clears it. Reachable from
+	 * outside too, since DROP can remove an instance that v1 LOAD
+	 * created.
+	 *
+	 * Here rather than in the DROP handler because this is the one place
+	 * every instance teardown passes through: DROP of an instance, DROP
+	 * of a module, and the rollback when a partial upload is undone.
+	 */
+	if (default_valid && default_inst == inst_handle(s)) {
+		default_valid = false;
+	}
 
 	if (s->exec_env != NULL) {
 		wasm_runtime_destroy_exec_env(s->exec_env);
@@ -602,12 +626,6 @@ static void handle_inventory(const struct wasp_msg *msg)
 
 	wasp_queue_tx(msg, WASP_MSG_RESULT, reply, n);
 }
-
-/* The v1 LOAD_MODULE/CALL/UNLOAD_MODULE trio addresses one implicit
- * instance. Remember which, so those messages keep their old meaning.
- */
-static uint8_t default_inst;
-static bool default_valid;
 
 static void release(struct inst_slot *slot)
 {

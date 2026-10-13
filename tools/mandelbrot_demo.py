@@ -41,7 +41,8 @@ import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from libwasp import WaspNode, discover, pack_ref, default_ctx, EV_MEM_WRITE
+from libwasp import (WaspNode, discover, pack_ref, default_ctx,
+                     EV_MEM_WRITE, FEAT_MULTI_INSTANCE)
 
 PARAMS_REGION, CTR_REGION, FB_REGION = 1, 2, 3
 Q = 1 << 28  # Q4.28
@@ -313,6 +314,9 @@ def parse_args():
     ap.add_argument("--span", type=float, default=3.2)
     ap.add_argument("--out", default="mandelbrot")
     ap.add_argument("--module", default=str(Path(__file__).parent / "mandelbrot_module.wasm"))
+    ap.add_argument("--instances", type=int, default=0,
+                   help="worker instances per node (0 = every free slot; "
+                        "1 = one, as before)")
     ap.add_argument("--no-live", action="store_true")
     ap.add_argument("--gif", action="store_true")
     ap.add_argument("--chaos", action="store_true")
@@ -363,24 +367,87 @@ def main():
         while (ev := ctx.poll_event(0.05)) is not None:
             on_event(ev)
 
-    pump_thread = threading.Thread(target=pump)
+    # daemon=True so an exception anywhere below still lets the process
+    # exit: this thread outlives main() otherwise and the only symptom is
+    # a hang with a traceback already printed, which reads like the demo
+    # froze rather than failed.
+    pump_thread = threading.Thread(target=pump, daemon=True)
     pump_thread.start()
 
     nodes = []
     for i, ip in enumerate(ips):
         node = WaspNode(ip, 4242, timeout=120.0, lock_owner=ip, tag=i)
         node.index = i
-        node.hello()
-        try:
-            node.load(wasm)
-        except ValueError as e:
-            if "BUSY" not in str(e):
-                raise
-            node.unload()  # stale module from an earlier (crashed) run
-            node.load(wasm)
+        _, _, features = node.hello()
+
+        # Several instances per node, each an independent worker stealing
+        # from the same tile counter. The work-stealing design needs no
+        # changes for this — MEM_ADD is atomic at the coordinator, so the
+        # number of claimants was never baked in. What it buys is latency
+        # hiding: while one instance waits on a round trip, the others
+        # compute, and round trips are a real fraction of the run.
+        node.insts = None
+        #
+        # --chaos deliberately kills a node's connection mid-render. With
+        # one instance per node that is a clean test of work re-issue;
+        # with several it also leaves the victim's other instances looping
+        # on a dead link until their RPCs time out, and recovery from that
+        # is not yet worked out — the run stalls rather than re-issuing.
+        # Until it is, chaos runs one instance per node, which is the
+        # configuration the re-issue path was built against.
+        #
+        if args.chaos and (features & FEAT_MULTI_INSTANCE) and args.instances != 1:
+            if i == 0:
+                print("  --chaos: using 1 instance per node "
+                      "(multi-instance node loss is not handled yet)")
+        elif features & FEAT_MULTI_INSTANCE:
+            # Clear anything a previous run left resident. A client that
+            # died mid-render leaves its instances loaded — the node has
+            # no idea the coordinator is gone — and the slots stay taken,
+            # so the next run gets NO_SLOTS and no amount of retrying
+            # helps. The v1 path has always handled this by unloading on
+            # BUSY; the instance path needs the same courtesy.
+            inv = node.inventory()
+            for m in inv["modules"]:
+                for attempt in range(5):
+                    try:
+                        node.drop_module(m["mod"])
+                        break
+                    except ValueError as e:
+                        # An instance still finishing its last call.
+                        if "BUSY" not in str(e) or attempt == 4:
+                            raise
+                        time.sleep(0.2)
+            if inv["modules"]:
+                inv = node.inventory()
+                print(f"  {ip}: released {len(inv['modules'])==0 and 'all' or 'some'} "
+                      f"stale module(s) from an earlier run")
+
+            want = args.instances or inv["slots_free"]
+            want = max(1, min(want, inv["slots_free"] or 1))
+            try:
+                node.mod, node.insts = node.upload(wasm, want)
+            except ValueError as e:
+                if "NO_SLOTS" not in str(e) and "NO_MEM" not in str(e):
+                    raise
+                # Asked for more than the pool can back; take one.
+                node.mod, node.insts = node.upload(wasm, 1)
+
+        if node.insts is None:
+            # Node predates the instance API: the v1 single-module path.
+            try:
+                node.load(wasm)
+            except ValueError as e:
+                if "BUSY" not in str(e):
+                    raise
+                node.unload()  # stale module from an earlier (crashed) run
+                node.load(wasm)
         nodes.append(node)
+
+    workers_per_node = [len(n.insts) if n.insts else 1 for n in nodes]
     print(f"rendering {demo.w}x{demo.h}, {demo.tiles} tiles, "
-          f"{len(nodes)} node(s)")
+          f"{len(nodes)} node(s), {sum(workers_per_node)} worker(s) "
+          f"{workers_per_node}")
 
     demo.t0 = time.monotonic()
     rec = (GifRecorder(f"{args.out}.gif", demo.w, demo.h, demo.max_iter)
@@ -389,11 +456,33 @@ def main():
         rec.snap(demo.fb, force=True)  # the all-unrendered first frame
 
     def worker(node):
+        """Run every instance of one node, over its single connection.
+
+        One thread per node, not per instance: the connection carries all
+        of them, so the calls go out together and are collected as they
+        finish. call_wait_any blocks on the socket, so the node's
+        remote-memory RPCs are served the moment they arrive — polling
+        with a sleep instead would cost about what a round trip costs and
+        give back the latency this is meant to recover.
+        """
+        refs = (pack_ref(PARAMS_REGION), pack_ref(CTR_REGION),
+                pack_ref(FB_REGION))
         try:
-            r = node.call("render", pack_ref(PARAMS_REGION),
-                          pack_ref(CTR_REGION), pack_ref(FB_REGION))[0]
-            if r < 0:
-                raise RuntimeError(f"render -> {r}")
+            if not node.insts:
+                r = node.call("render", *refs)[0]
+                if r < 0:
+                    raise RuntimeError(f"render -> {r}")
+                return
+
+            for inst in node.insts:
+                node.call_inst_async(inst, "render", *refs)
+            while node.inflight():
+                got = node.call_wait_any()
+                if got is None:
+                    raise RuntimeError("render timed out")
+                inst, res = got
+                if res and res[0] < 0:
+                    raise RuntimeError(f"render on instance {inst} -> {res[0]}")
         except Exception as e:  # noqa: BLE001 — node loss is expected under --chaos
             demo.dead[node.index] = repr(e)
 
@@ -425,8 +514,11 @@ def main():
               f"{len(alive)} surviving node(s)")
         for j, tile in enumerate(missing):
             node = alive[j % len(alive)]
-            r = node.call("render_tile", pack_ref(PARAMS_REGION),
-                          pack_ref(FB_REGION), tile)[0]
+            # call() addresses the v1 default instance, which a run using
+            # the instance API does not have — it would answer NO_MODULE.
+            args_ = (pack_ref(PARAMS_REGION), pack_ref(FB_REGION), tile)
+            r = (node.call_inst(node.insts[0], "render_tile", *args_)
+                 if node.insts else node.call("render_tile", *args_))[0]
             if r != 1:
                 raise SystemExit(f"re-issue of tile {tile} failed: {r}")
             if rec:
@@ -439,7 +531,15 @@ def main():
     dt = time.monotonic() - demo.t0
     for node in alive:
         try:
-            node.unload()
+            # Release the right thing: unload() addresses the single v1
+            # instance and fails with NO_MODULE when the run used the
+            # instance API, and since this is wrapped in a bare except
+            # that failure is silent — which is how a run used to leave
+            # all three slots occupied for whatever came next.
+            if node.insts:
+                node.drop_module(node.mod)
+            else:
+                node.unload()
             node.sock.close()
         except Exception:
             pass

@@ -772,3 +772,69 @@ int wasp_call_poll(wasp_node *n, int32_t results[WASP_CALL_MAX_RESULTS])
 {
 	return wasp_call_poll_any(n, NULL, results);
 }
+
+/*
+ * Blocking form of wasp_call_poll_any.
+ *
+ * wasp_call_poll_any polls with a zero timeout, which is right for a
+ * conductor interleaving several nodes from one thread: it returns
+ * WASP_E_AGAIN at once and the caller moves on. It is wrong for waiting
+ * on the instances of a *single* node, where the only options would be a
+ * busy spin or a sleep — and a sleep long enough to be cheap is
+ * comparable to a remote-memory round trip, so it would pay for the
+ * latency hiding it was meant to collect.
+ *
+ * This waits on the socket instead, so the node's own RPCs are answered
+ * the moment they arrive.
+ */
+int wasp_call_wait_any(wasp_node *n, uint8_t *inst_out,
+		       int32_t results[WASP_CALL_MAX_RESULTS],
+		       uint32_t timeout_ms)
+{
+	uint64_t deadline;
+	int rc;
+
+	if (!n)
+		return WASP_E_ARG;
+	if (wasp_call_inflight(n) == 0)
+		return WASP_E_ARG;
+
+	/* A response may already be sitting parsed in its slot. */
+	rc = harvest(n, inst_out, results);
+	if (rc != WASP_E_AGAIN)
+		return rc;
+
+	deadline = wasp_now_ms() + timeout_ms;
+	for (;;) {
+		struct wasp_call_slot *sl;
+		uint64_t now = wasp_now_ms();
+		uint32_t left = (now >= deadline) ? 0 :
+				(uint32_t)(deadline - now);
+		uint8_t t, s;
+		uint32_t l;
+
+		if (!wasp_net_readable(n->fd, left))
+			return WASP_E_TIMEOUT;
+
+		rc = recv_frame(n, &t, &s, &l);
+		if (rc != WASP_OK) {
+			slots_abort(n);
+			return rc;
+		}
+		if (is_node_request(t)) {
+			rc = wasp_host_serve(n, t, s, n->rx, l);
+			if (rc != WASP_OK) {
+				slots_abort(n);
+				return rc;
+			}
+			continue;
+		}
+		sl = slot_by_seq(n, s);
+		if (!sl) {
+			slots_abort(n);
+			return WASP_E_STREAM;
+		}
+		complete_slot(n, sl, t, n->rx, l);
+		return harvest(n, inst_out, results);
+	}
+}

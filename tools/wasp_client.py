@@ -496,6 +496,27 @@ class WaspNode:
         if t != RESULT:
             raise ValueError(f"drop module failed: {err_name(payload)}")
 
+    def reset(self):
+        """Release everything resident, whatever shape it is in.
+
+        A coordinator that dies mid-run leaves its modules and instances
+        loaded — the node has no way to know the other end is gone — and
+        the slots stay taken. Anything that wants a clean node has to be
+        able to say so, rather than assuming it inherited one.
+        """
+        try:
+            for m in self.inventory()["modules"]:
+                try:
+                    self.drop_module(m["mod"])
+                except ValueError:
+                    pass          # an instance still finishing a call
+        except ValueError:
+            pass                  # node predates INVENTORY
+        try:
+            self.unload()         # and the v1 default instance, if any
+        except ValueError:
+            pass
+
     def inventory(self) -> dict:
         """What is resident on the node and how much room is left."""
         t, _, payload = self.request(INVENTORY)
@@ -713,6 +734,7 @@ def cmd_instances(node: WaspNode, args):
 
     _, _, features = node.hello()
     check("node advertises MULTI_INSTANCE", bool(features & FEAT_MULTI_INSTANCE))
+    node.reset()  # a previous run may have died holding slots
 
     inv = node.inventory()
     total = inv["slots_total"]
@@ -799,6 +821,7 @@ def cmd_concurrency(node: WaspNode, args):
     _, _, features = node.hello()
     check("node advertises MULTI_INSTANCE", bool(features & FEAT_MULTI_INSTANCE))
     check("node advertises remote memory", bool(features & FEAT_REMOTE_MEM))
+    node.reset()  # a previous run may have died holding slots
 
     inv = node.inventory()
     if inv["slots_free"] < 2:
@@ -869,6 +892,17 @@ def cmd_concurrency(node: WaspNode, args):
           f"{inv['slots_free']}/{inv['slots_total']} slots free")
 
     print("all concurrency checks passed")
+
+
+def cmd_reset(node: WaspNode, args):
+    node.hello()
+    node.reset()
+    try:
+        inv = node.inventory()
+        print(f"{inv['slots_free']}/{inv['slots_total']} slots free, "
+              f"pool {inv['pool_free']} B")
+    except ValueError:
+        print("reset")
 
 
 def cmd_load(node: WaspNode, args):
@@ -964,6 +998,7 @@ def main():
     p = sub.add_parser("instances", help="multi-instance self-test")
     p.add_argument("module", help=".wasm exporting add(i32,i32)")
     p.add_argument("module2", nargs="?", help="a second, different .wasm")
+    sub.add_parser("reset", help="release every module/instance on the node")
     p = sub.add_parser("load", help="load a module")
     p.add_argument("module", help="path to .wasm file")
     sub.add_parser("unload", help="unload the module")
@@ -983,7 +1018,7 @@ def main():
 
     handlers = {"check": cmd_check, "lifecycle": cmd_lifecycle, "remote": cmd_remote,
                 "remote2": cmd_remote2, "instances": cmd_instances,
-                "concurrency": cmd_concurrency,
+                "concurrency": cmd_concurrency, "reset": cmd_reset,
                 "load": cmd_load, "unload": cmd_unload,
                 "call": cmd_call, "identify": cmd_identify, "reboot": cmd_reboot,
                 None: cmd_check}

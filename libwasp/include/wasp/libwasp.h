@@ -207,6 +207,16 @@ int wasp_call_inst_async(wasp_node *n, uint8_t inst, const char *fn,
 int wasp_call_poll(wasp_node *n, int32_t results[WASP_CALL_MAX_RESULTS]);
 int wasp_call_poll_any(wasp_node *n, uint8_t *inst_out,
 		       int32_t results[WASP_CALL_MAX_RESULTS]);
+/*
+ * Blocking form: waits on the socket for up to timeout_ms, answering the
+ * node's remote-memory RPCs as they arrive, and returns the first call to
+ * complete (WASP_E_TIMEOUT if none does). Use this to drive the several
+ * instances of one node; use wasp_call_poll_any to interleave across
+ * nodes without blocking on any of them.
+ */
+int wasp_call_wait_any(wasp_node *n, uint8_t *inst_out,
+		       int32_t results[WASP_CALL_MAX_RESULTS],
+		       uint32_t timeout_ms);
 /* Async calls sent but not yet harvested. */
 int wasp_call_inflight(wasp_node *n);
 

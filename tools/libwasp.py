@@ -24,6 +24,11 @@ LIB_DIR = Path(__file__).resolve().parent.parent / "libwasp"
 
 PROTO_VERSION = 1
 ANNOUNCE_PORT = 4243
+
+# HELLO_ACK / ANNOUNCE feature bits (protocol.h).
+FEAT_REMOTE_MEM = 0x01
+FEAT_ATOMICS = 0x02
+FEAT_MULTI_INSTANCE = 0x04
 EV_MEM_WRITE = 1
 
 ERR_NAMES = {
@@ -124,6 +129,8 @@ def _load_lib():
         ctypes.POINTER(ctypes.c_int32), u32)
     sig("wasp_call_poll_any", ctypes.c_int, p, ctypes.POINTER(u8),
         ctypes.POINTER(ctypes.c_int32))
+    sig("wasp_call_wait_any", ctypes.c_int, p, ctypes.POINTER(u8),
+        ctypes.POINTER(ctypes.c_int32), u32)
     sig("wasp_call_inflight", ctypes.c_int, p)
     sig("wasp_discover", ctypes.c_int, ctypes.POINTER(_CInfo), u32, u32, u16)
     return lib
@@ -390,6 +397,25 @@ class WaspNode:
     def drop_module(self, mod: int):
         self._check(_lib.wasp_drop_module(self._n, mod), "drop module")
 
+    def reset(self):
+        """Release everything resident, whatever shape it is in.
+
+        Mirrors wasp_client.WaspNode.reset so the shared self-test
+        suites run unchanged against either implementation.
+        """
+        try:
+            for m in self.inventory()["modules"]:
+                try:
+                    self.drop_module(m["mod"])
+                except ValueError:
+                    pass          # an instance still finishing a call
+        except ValueError:
+            pass                  # node predates INVENTORY
+        try:
+            self.unload()         # and the v1 default instance, if any
+        except ValueError:
+            pass
+
     def inventory(self) -> dict:
         inv = _CInventory()
         self._check(_lib.wasp_inventory_get(self._n, ctypes.byref(inv)),
@@ -420,6 +446,22 @@ class WaspNode:
         if rc == -107:  # WASP_E_AGAIN
             return None
         rc = self._check(rc, "poll")
+        return inst.value, [out[i] for i in range(rc)]
+
+    def call_wait_any(self, timeout_ms: int = 120000):
+        """Block until one outstanding call finishes; (instance, results).
+
+        Returns None on timeout. Unlike call_poll_any this waits on the
+        socket, so the node's remote-memory RPCs are answered as they
+        arrive rather than once per polling interval — which matters when
+        a round trip is of the same order as any sleep you would use.
+        """
+        inst = ctypes.c_uint8()
+        out = (ctypes.c_int32 * 4)()
+        rc = _lib.wasp_call_wait_any(self._n, ctypes.byref(inst), out, timeout_ms)
+        if rc == -100:  # WASP_E_TIMEOUT
+            return None
+        rc = self._check(rc, "wait")
         return inst.value, [out[i] for i in range(rc)]
 
     def inflight(self) -> int:
