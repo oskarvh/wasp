@@ -151,25 +151,46 @@ def draw(demo, final=False):
 
 
 def live_view(demo, workers, rec=None):
+    """Live terminal view. Redraws at REDRAW but polls at POLL, so the
+    loop notices the workers finishing promptly: the redraw rate is a
+    display choice and should not become the resolution of the reported
+    render time (see plain_view).
+    """
+    REDRAW = 0.25
+    POLL = 0.02
     print("\x1b[2J\x1b[?25l", end="")
     try:
+        last_draw = 0.0
         while any(t.is_alive() for t in workers):
             if rec:
                 rec.snap(demo.fb)
-            draw(demo)
-            time.sleep(0.25)
+            if time.monotonic() - last_draw >= REDRAW:
+                last_draw = time.monotonic()
+                draw(demo)
+            time.sleep(0.25 if rec else POLL)
         draw(demo)
     finally:
         print("\x1b[?25h", end="", flush=True)
 
 
 def plain_view(demo, workers, rec=None):
+    """Watch progress without the live view.
+
+    The poll interval and the print interval are deliberately separate.
+    They used to be one `time.sleep(2.0)`, which quantised the reported
+    render time to two seconds: a 0.4 s render and a 1.9 s one both came
+    out as "2.1s", and anything faster than the sleep was invisible. Any
+    conclusion about where the time goes needs a finer ruler than the
+    thing being measured.
+    """
+    POLL = 0.02
+    PRINT_EVERY = 2.0
     last_print = 0.0
     while any(t.is_alive() for t in workers):
         if rec:
             rec.snap(demo.fb)
-        time.sleep(0.25 if rec else 2.0)
-        if time.monotonic() - last_print >= 2.0:
+        time.sleep(0.25 if rec else POLL)
+        if time.monotonic() - last_print >= PRINT_EVERY:
             last_print = time.monotonic()
             print(f"  {demo.done()}/{demo.tiles} tiles, per node {demo.counts()}",
                   flush=True)
