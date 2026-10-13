@@ -3527,6 +3527,16 @@
 		)
 		(uuid "25d2059f-1ce3-4aec-94b3-37b1f87d0cc8")
 	)
+	(text "NOTE: The data lines are shorted lol. \nChange this in rev 2"
+		(exclude_from_sim no)
+		(at 102.108 66.04 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+		(uuid "49665da0-f877-4b5e-a7a3-2acb4e1eda49")
+	)
 	(text "FB resistors TPSM86325[2,7]:\nR10 = 135k\nR11 = 30k\nFB resistors TPSM863253:\nR10 = 0R\nR11 = DNM"
 		(exclude_from_sim no)
 		(at 146.05 107.95 0)
