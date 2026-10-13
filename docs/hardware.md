@@ -711,10 +711,26 @@ the device and 3/4 as the other, and assigns:
 | 3 | I/O2 | `USB_CONN_D_N` | shorts the connector-side pair |
 | 4 | I/O2 | `USB_CONN_D_P` | " |
 
-So D+ is shorted to D− at the connector, D+ is shorted to D− at the MCU,
-and there is no path at all between the two halves. ERC cannot see it:
-each pin is a distinct schematic pin, and the short exists only inside
-the package.
+To be precise about where the shorts are, because it is easy to blame the
+wrong part: J7 itself is wired correctly. Tying A6 and B6 together as D+
+and A7 and B7 together as D− is not a mistake, it is what makes the
+receptacle work with the cable either way up. The shorts are created by
+U2, which bridges two nets that should be distinct:
+
+```
+USB_CONN_D_P   J7.A6(D+)  J7.B6(D+)   U2.4(I/O2) ─┐ one internal node,
+USB_CONN_D_N   J7.A7(D-)  J7.B7(D-)   U2.3(I/O2) ─┘ so U2 joins the nets
+
+USB_EMI_D_P    FL1.1      U2.1(I/O1)  ─┐ likewise
+USB_EMI_D_N    FL1.2      U2.6(I/O1)  ─┘
+```
+
+And nothing bridges the `CONN_*` nets to the `EMI_*` nets: U2 was meant
+to be that bridge — signal in on pin 1, out on pin 6 — and as wired it is
+not, so the connector half and the MCU half are simply disconnected. Both
+shorts exist only while U2 is fitted. ERC cannot see any of it, because
+every pin is a distinct schematic pin and the connection is inside the
+package.
 
 **FL1, the common-mode choke.** Mounted with a Pulse `PH9455x105NL`
 symbol against an `ACM2012_TDK` footprint for a TDK ACM2012-361-2P. Both
