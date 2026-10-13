@@ -302,6 +302,31 @@ not answer. For an older V2 or a clone, swap the transport line for
 `hla_swd`; if your SWD pigtail omits NRST, use `reset_config none
 separate`. Both are noted in the file.
 
+**Reflashing over USB, no debugger.** The H723 has a DFU bootloader in
+system memory, so the board can be flashed with nothing but a USB-C
+cable. Two ways in:
+
+```sh
+# 1. the button: hold SW2 (BOOT0) and tap reset, then
+dfu-util -a 0 -s 0x08000000:leave -D build/node/zephyr/zephyr.bin
+
+# 2. over the network, no hands on the board (same flag the Picos use)
+python3 tools/wasp_client.py <node-ip> reboot --bootsel
+```
+
+The second route leaves a magic word in uninitialised RAM, resets, and
+jumps to the ROM bootloader from `PRE_KERNEL_1` priority 0 — ahead of the
+clock driver, so the chip is still on its reset defaults rather than at
+550 MHz on a PLL with caches and Ethernet DMA live. See the comment at the
+top of `app/src/boot_dfu.c`.
+
+Either way the board must be on USB-C **as a data link to the PC**: per
+AN2606 the bootloader samples its interfaces and leaves for the
+application when no host answers, and a charger or a power-only cable
+looks exactly like no host. If the node boots normally instead of
+appearing as `0483:df11`, the console says which of the two failures it
+was.
+
 Pass `-p` to `west build` after changing Kconfig or devicetree — Kconfig
 results are cached and a plain rebuild will silently keep the old values.
 

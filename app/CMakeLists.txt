@@ -25,6 +25,9 @@ target_sources(app PRIVATE
   src/main.c
   src/led.c
   src/net/netup.c
+  # ROM USB bootloader entry; compiles to a pair of stubs where the SoC
+  # has none.
+  src/boot_dfu.c
   # Self-guards on the eth_switch devicetree node, so it compiles to nothing
   # on boards without a KSZ8794 (the Nucleos, the Picos).
   src/net/ksz8794.c

@@ -40,24 +40,34 @@ static void handle_hello(const struct wasp_msg *msg)
 static void handle_reboot(const struct wasp_msg *msg)
 {
 	uint8_t mode = msg->len >= 1 ? msg->payload[0] : 0;
+	bool bootloader = (mode == 1);
 
-#ifndef CONFIG_SOC_RP2040
-	if (mode == 1) {
+	/*
+	 * Mode 1 means "come up in the USB bootloader so I can reflash
+	 * you". On the RP2040 that is BOOTSEL; on an STM32H7 it is the DFU
+	 * bootloader in system memory (see boot_dfu.c). Either way the
+	 * coordinator asks the same thing and need not know which board it
+	 * is talking to.
+	 */
+	if (bootloader && !IS_ENABLED(CONFIG_SOC_RP2040) &&
+	    !wasp_boot_dfu_supported()) {
 		wasp_queue_error(msg, WASP_ERR_UNSUPPORTED, "no bootloader entry on this SoC");
 		return;
 	}
-#endif
 
-	LOG_INF("rebooting%s on coordinator request", mode == 1 ? " into USB bootloader" : "");
+	LOG_INF("rebooting%s on coordinator request", bootloader ? " into USB bootloader" : "");
 	wasp_queue_tx(msg, WASP_MSG_RESULT, NULL, 0);
 	/* Let the net thread flush the RESULT before we pull the plug. */
 	k_sleep(K_MSEC(500));
 
 #ifdef CONFIG_SOC_RP2040
-	if (mode == 1) {
+	if (bootloader) {
 		reset_usb_boot(0, 0);
 	}
 #endif
+	if (bootloader) {
+		wasp_boot_dfu(); /* resets into the ROM bootloader */
+	}
 	sys_reboot(SYS_REBOOT_COLD);
 }
 

@@ -9,6 +9,7 @@
 #ifndef WASP_H_
 #define WASP_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <zephyr/kernel.h>
 
@@ -78,5 +79,14 @@ int wasp_rpc_call(uint8_t type, const void *payload, uint32_t len, uint8_t conn,
  * ownership).
  */
 bool wasp_rpc_deliver(struct wasp_msg *msg);
+
+/*
+ * Reboot into the SoC's ROM USB bootloader (boot_dfu.c). Returns via a
+ * reset, so it does not return. wasp_boot_dfu_supported() says whether
+ * this SoC has a usable one; where it does not, the node answers
+ * ERROR(UNSUPPORTED) instead.
+ */
+bool wasp_boot_dfu_supported(void);
+void wasp_boot_dfu(void);
 
 #endif /* WASP_H_ */
