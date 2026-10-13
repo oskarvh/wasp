@@ -47,6 +47,39 @@ include(${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
 zephyr_library_named(wamr)
 zephyr_library_sources(${WAMR_RUNTIME_LIB_SOURCE})
 
+#
+# Optimise the interpreter for speed even when the rest of the image is
+# built for size, which is Zephyr's default and the right default for
+# everything else here.
+#
+# This is not a guess. The mandelbrot demo is compute-bound in the
+# interpreter and nowhere near the network: doubling the iteration count
+# doubles the run time, while doubling the number of remote-memory round
+# trips (half-height tiles, same pixels) changes it by less than 5%. So
+# whatever the interpreter's dispatch loop costs is essentially the whole
+# bill.
+#
+# Measured on one wasp node board, 256x192 at 96 iterations: 4.3 s with
+# the library at -Os against 2.3 s at -O2, a 1.87x speedup from a
+# compiler flag. Building the whole image -O2 achieves the same thing but
+# costs ~33 KB of flash to do it; confining it to this library gets the
+# win where it is actually earned.
+#
+# WAMR_BUILD_FAST_INTERP is already on, so this stacks on top of the
+# faster of WAMR's two interpreters rather than papering over the slower.
+#
+# Set as a source property rather than with target_compile_options: the
+# -Os comes from zephyr_interface, whose INTERFACE options are appended
+# after a target's own PRIVATE ones, so target_compile_options yields
+# "-O2 -Os" and gcc takes the last. Source properties are emitted later
+# still, which puts -O2 where it wins. Check with:
+#   grep -o '\-O[a-z0-9]*' build/<d>/compile_commands.json | ...
+if(CONFIG_SIZE_OPTIMIZATIONS)
+  set_source_files_properties(${WAMR_RUNTIME_LIB_SOURCE}
+    TARGET_DIRECTORY wamr
+    PROPERTIES COMPILE_OPTIONS "-O2")
+endif()
+
 # Public runtime API (wasm_export.h) for the application.
 zephyr_include_directories(${WAMR_ROOT_DIR}/core/iwasm/include)
 
