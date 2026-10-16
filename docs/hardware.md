@@ -1188,8 +1188,8 @@ remove unconnected inner-layer pads.
 
 ## Open questions
 
-Most of the original list is now answered — from DS00002134C, or by
-decision. What's left:
+Most of the original list is now answered — from DS00002134C, by
+decision, or on hardware. What's left:
 
 1. **The MCU's real power draw.** The switch side is now measured
    from the datasheet (~0.5 W, above), so what is left of the ~1.6 W
@@ -1200,31 +1200,56 @@ decision. What's left:
    what percentage still lets ANNOUNCE broadcasts and ARP through
    comfortably at fleet scale is an empirical question, and the wrong
    answer breaks discovery in a way that will look like a wasp bug.
-3. **Whether the switch's 25 MHz REFCLKO is clean enough for the
-   MCU's HSE.** No longer gates layout — the 0 Ω select above defers
-   it to bring-up — but it does decide which two parts get populated,
-   so measure it on the Nucleo + switch breakout before the first
-   build.
+3. ~~**Whether the switch's 25 MHz REFCLKO is clean enough for the
+   MCU's HSE.**~~ **Answered on hardware: yes.** R26 populated, HSE in
+   bypass mode, PLL1 locks and runs SYSCLK at 550 MHz with HCLK at 275;
+   `main()` reads the achieved tree back out of RCC on every boot
+   precisely because a silent failure to lock would otherwise look like
+   a normal boot. Ethernet works across two daisy-chained boards, and
+   the RMII 50 MHz on PA1 comes from the same chip.
 
 ## Firmware work implied
 
-Unchanged from the roadmap entry in the main README: instance handles
-in `LOAD_MODULE`/`CALL`/`UNLOAD_MODULE`, one executor thread +
-exec_env per running call, the node→coordinator RPC slot generalized
-to a table keyed by instance — plus, for this board:
+> **Mostly done.** The board is built and running: two of them
+> daisy-chained, 550 MHz from the switch's REFCLKO, three instances
+> each. What follows was the plan; the markers record where it landed.
 
-- the OCTOSPI PSRAM devicetree/linker plumbing, and pointing the WAMR
-  pool at it;
-- a fixed-link Ethernet devicetree node for the MCU↔switch RMII link
-  (no PHY driver);
-- the boot-time SPI config routine for the switch (storm protection,
-  self-address filtering, port enables), and reading the per-port MIB
-  counters out over the wasp protocol;
-- USB CDC-ACM console on Zephyr's `usb_device_next` stack, keeping
-  the UART console as the early-boot and hardfault path;
-- optionally, the out-of-band port watchdog described above — the only
-  place any RSTP-adjacent logic lives, and it is a polling loop over
-  SPI, not a protocol.
+The generic part is complete — instance handles (as `MODULE_UPLOAD` /
+`CALL_INST` / `DROP`, with the v1 trio kept as a default-instance shim),
+an executor pool rather than one thread, and the node→coordinator RPC
+slot generalized to a table. Per-instance metrics were added on top,
+which were not in the plan and are what identified the coordinator as
+the current ceiling. Board-specific:
+
+- **abandoned** — the OCTOSPI PSRAM plumbing exists (devicetree, MPU
+  region, a driver for the quad part) but the array cannot be written
+  through a memory-mapped window on this silicon, so the WAMR pool is
+  *not* pointed at it. It instead sizes itself at boot from whatever
+  SRAM is left over, which on 320 KiB is enough for three instances.
+  See the v1 erratum above; v2 goes octal;
+- **done** — a fixed-link Ethernet devicetree node for the MCU↔switch
+  RMII link, no PHY driver;
+- **partly done** — the boot-time SPI config routine. It turned out to
+  carry one write nobody had anticipated and that nothing works
+  without: port 4 comes out of reset in RGMII mode while the board is
+  wired RMII. Broadcast storm protection is enabled on the three
+  external ports and the port enables are at their (correct) reset
+  defaults. Still open: self-address filtering, deliberately left off
+  because with the MCU's own MAC configured it would also match frames
+  the MCU transmits and the data sheet does not say whether the ingress
+  port is exempt; and reading the per-port MIB counters out over the
+  wasp protocol, not started;
+- **blocked** — USB CDC-ACM console. The config and overlay exist
+  (`app/boards/wasp_node_cdc.*`) but are untested, because on v1 the USB
+  data pair never reaches the MCU. The UART console on J9 is the only
+  path, and is in any case the one that survives a hardfault;
+- **not started** — the optional out-of-band port watchdog.
+
+Added along the way, absent from the plan: entry into the ROM DFU
+bootloader, both by holding SW2 through a reset and over the network via
+`REBOOT` mode 1. The hardware path should work once the USB erratum is
+reworked; the software jump runs and the ROM bootloader hands control
+back, which is what it does when no USB host answers.
 
 Note what is *absent*: no DSA driver, no tail-tag shim, no spanning
 tree, nothing of ours in the Ethernet hot path. That is the whole

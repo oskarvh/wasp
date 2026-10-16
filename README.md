@@ -740,6 +740,49 @@ Phase 4 — research:
       directions over one socket (the 0x4x range), so only who dials
       changes. mDNS/DNS-SD was considered and rejected: it is
       link-local, same as broadcast.
+- [x] **Purpose-built node board, built and running** — STM32H723ZG at
+      550 MHz + KSZ8794 3-port switch, `boards/wasp/wasp_node`. Two of
+      them daisy-chained through their own switch ports, no external
+      switch. Answered the open question that gated it: the switch's
+      25 MHz REFCLKO *is* clean enough to run the MCU's HSE, and PLL1
+      locks on it at 550 MHz. Two faults found in the process, both
+      recorded in [docs/hardware.md](docs/hardware.md) for a rev 2: the
+      external quad PSRAM cannot be written through memory-mapped
+      OCTOSPI on this silicon (so the WAMR pool stays in SRAM, and v2
+      goes octal), and the USB data pair never reaches the MCU (U2
+      bridges nets that should be distinct, FL1 crosses D+/D−).
+- [x] Multiple WAMR instances per node — `MODULE_UPLOAD` with an
+      instance count, `INSTANTIATE`, `CALL_INST`, `DROP`, `INVENTORY`,
+      behind `WASP_FEAT_MULTI_INSTANCE`; handles carry a generation so a
+      stale one is refused rather than hitting whatever took its slot.
+      An executor pool replaces the single executor and the
+      node→coordinator RPC slot became a table, so instances of one node
+      run concurrently — proved deterministically by withholding a
+      `MEM_DATA` and watching another instance finish anyway. The v1
+      `LOAD_MODULE`/`CALL`/`UNLOAD_MODULE` trio is kept as a
+      default-instance shim, so older clients and the Pico fleet are
+      untouched. Three instances fit on the H723's 320 KiB; the pool
+      sizes itself at boot from whatever RAM is spare, so one image
+      suits every board.
+- [x] Per-instance metrics — nodes count time inside the interpreter
+      against time waiting on a remote-memory round trip, which host
+      wall-clock cannot separate. `wasp_client.py <ip> stats` and
+      `mandelbrot_demo.py --stats`. What they showed: at 256×192 the
+      coordinator is the ceiling (wait per round trip grows linearly
+      with concurrent workers, 2.05 → 6.24 → 11.8 ms for 2, 4 and 6),
+      while at 1920×1080 the nodes are compute-bound at ~98% core
+      utilisation. The bottleneck moves with the size of the work.
+- [ ] Teach the conductor the instance API — `app/src/peer/conductor.c`
+      and `swarm_test.py`/`perf_test.py` still treat each node as one
+      worker, so they see two workers where the fleet offers six.
+      `libwasp` already speaks it (`wasp_upload`, `wasp_call_inst`,
+      `wasp_call_wait_any`), so this is wiring, not design.
+- [ ] Lift the coordinator ceiling — it services all remote memory
+      behind one mutex, which the metrics above identify as the limit
+      for small work. Either per-region locks, or batch the per-tile
+      `MEM_ADD`/`MEM_WRITE` pair so there are simply fewer round trips
+      (two per tile today, and the claim could ride along with the
+      previous tile's write).
 - [ ] Multiple WAMR instances per node — on RAM-rich MCUs (RP2350:
       520 KiB, STM32H7: ~1 MiB, ESP32-S3: up to 8 MiB PSRAM) one
       physical node could host N module instances and present as N
@@ -750,11 +793,11 @@ Phase 4 — research:
       `LOAD_MODULE`/`CALL`/`UNLOAD_MODULE`, one executor thread (and
       exec_env) per running call instead of the single executor, and
       the node→coordinator RPC slot generalized to a small table keyed
-      by instance. Today's fleet stays single-instance: the Pico W is
-      at ~93% RAM and the F439's pool fits exactly one 64 KiB page.
-      A purpose-built node board for this (STM32H723 + octal PSRAM +
-      a per-node Ethernet switch) is sketched in
-      [docs/hardware.md](docs/hardware.md).
+      by instance. **Superseded by the two entries above — kept for the
+      reasoning.** The Pico W (~93% RAM) and the F439 (pool fits exactly
+      one 64 KiB page) do stay single-instance, which is now expressed
+      as `CONFIG_WASP_MAX_INSTANCES=1` in their board configs rather
+      than as a property of the firmware.
 - [ ] Coordinator — `libwasp` C core with a Python binding on top,
       also embeddable in firmware so nodes can delegate pooled worker
       functions to idle peers with or without a dedicated coordinator
