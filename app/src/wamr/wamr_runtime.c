@@ -842,7 +842,7 @@ static void handle_call(const struct wasp_msg *msg, bool with_handle)
 	}
 
 	/* -- execute -- */
-	uint32_t t0 = k_cycle_get_32();
+	uint64_t t0 = k_cycle_get_64();
 	bool ok = wasm_runtime_call_wasm(slot->exec_env, func, argc, cells);
 
 	/*
@@ -850,12 +850,16 @@ static void handle_call(const struct wasp_msg *msg, bool with_handle)
 	 * subtracting ctx.rpc_wait_ns from this is what separates compute
 	 * from transmission.
 	 *
-	 * Caveat: k_cycle_get_32 wraps every ~7.8 s at 550 MHz, so a single
-	 * call lasting longer than that is undercounted. Calls here are
-	 * milliseconds; a module that deliberately ran for minutes inside
-	 * one CALL would need a 64-bit cycle counter.
+	 * k_cycle_get_64 is not optional here. The 32-bit counter wraps
+	 * every ~7.8 s at 550 MHz, and a call is not necessarily short: a
+	 * module is free to loop inside a single export, and the mandelbrot
+	 * demo does exactly that — one render call walks every tile, so at
+	 * 1920x1080 it runs for half a minute. With the 32-bit counter that
+	 * reported 6.00 s (29.6 modulo 7.81), less than the RPC wait
+	 * accrued inside it, giving a nonsensical 329% waiting and a compute
+	 * figure clamped to zero.
 	 */
-	slot->ctx.exec_ns += k_cyc_to_ns_floor64(k_cycle_get_32() - t0);
+	slot->ctx.exec_ns += k_cyc_to_ns_floor64(k_cycle_get_64() - t0);
 	slot->ctx.calls++;
 
 	if (!ok) {

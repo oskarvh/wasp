@@ -72,7 +72,7 @@ static int rpc(wasm_exec_env_t exec_env, uint8_t type, const void *payload, uint
 	       struct wasp_msg *resp)
 {
 	struct wasp_inst_ctx *ctx = ctx_of(exec_env);
-	uint32_t t0 = k_cycle_get_32();
+	uint64_t t0 = k_cycle_get_64();
 	int rc = wasp_rpc_call(type, payload, len, ctx ? ctx->conn : 0, resp,
 			       RPC_TIMEOUT);
 
@@ -81,14 +81,15 @@ static int rpc(wasm_exec_env_t exec_env, uint8_t type, const void *payload, uint
 	 * the executor pool exists to overlap, so it is the number that
 	 * says whether having several instances is buying anything.
 	 *
-	 * k_cycle_get_32 counts at CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC and so
-	 * wraps every ~7.8 s at 550 MHz. Only one interval is measured here
-	 * and an RPC is abandoned after five seconds, so a wrap cannot be
-	 * reached; the 64-bit accumulator is what keeps the total honest.
+	 * k_cycle_get_64, not the 32-bit form: that counts at
+	 * CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC and wraps every ~7.8 s at
+	 * 550 MHz. An RPC is abandoned after five seconds so it would just
+	 * survive here, but there is no reason to rely on that when
+	 * CONFIG_TIMER_HAS_64BIT_CYCLE_COUNTER is set.
 	 */
 	if (ctx != NULL) {
 		ctx->rpc_count++;
-		ctx->rpc_wait_ns += k_cyc_to_ns_floor64(k_cycle_get_32() - t0);
+		ctx->rpc_wait_ns += k_cyc_to_ns_floor64(k_cycle_get_64() - t0);
 		ctx->rpc_tx += len;
 		if (rc == 0) {
 			ctx->rpc_rx += resp->len;

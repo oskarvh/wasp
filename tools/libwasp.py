@@ -419,6 +419,11 @@ class WaspNode:
                 "exec_us": exec_us, "rpc_count": rpc_count,
                 "rpc_wait_us": rpc_wait_us, "rpc_tx": rpc_tx, "rpc_rx": rpc_rx,
                 "compute_us": max(0, exec_us - rpc_wait_us),
+                # See wasp_client.WaspNode.stats: waiting cannot exceed
+                # exec, so when it does a counter has overflowed and the
+                # derived figures are junk. Both bindings must set this or
+                # print_stats, which is shared, cannot warn.
+                "bogus": rpc_wait_us > exec_us,
             })
         return out
 

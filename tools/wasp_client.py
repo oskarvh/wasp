@@ -519,6 +519,13 @@ class WaspNode:
                 "exec_us": exec_us, "rpc_count": rpc_count,
                 "rpc_wait_us": rpc_wait_us, "rpc_tx": rpc_tx, "rpc_rx": rpc_rx,
                 "compute_us": max(0, exec_us - rpc_wait_us),
+                # A round trip is timed inside the call that issued it, so
+                # waiting can never exceed exec. When it does, a counter
+                # has overflowed somewhere and every derived figure is
+                # junk — say so rather than clamping compute to zero and
+                # letting it read as "spent no time computing", which is
+                # how a 32-bit cycle-counter wrap once disguised itself.
+                "bogus": rpc_wait_us > exec_us,
             })
         return out
 
@@ -978,11 +985,16 @@ def print_stats(rows: list[dict], label: str = ""):
 
     def row(name, r):
         pct = (100.0 * r["rpc_wait_us"] / r["exec_us"]) if r["exec_us"] else 0.0
+        if r.get("bogus"):
+            name += "!"
         print(f"{label}{name:>5} {r['calls']:>6} {_dur(r['exec_us']):>9} "
               f"{_dur(r['compute_us']):>9} {_dur(r['rpc_wait_us']):>9} "
               f"{pct:>5.1f}% {r['rpc_count']:>6} "
               f"{_bytes(r['rpc_tx'] + r['rpc_rx']):>8}")
 
+    if any(r.get("bogus") for r in rows):
+        print(f"{label}!! waiting exceeds exec on a row marked '!': a counter "
+              f"overflowed and these numbers are not usable")
     tot = {k: 0 for k in ("calls", "exec_us", "compute_us", "rpc_wait_us",
                           "rpc_count", "rpc_tx", "rpc_rx")}
     shown = 0
