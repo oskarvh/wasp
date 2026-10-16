@@ -943,30 +943,65 @@ def cmd_concurrency(node: WaspNode, args):
     print("all concurrency checks passed")
 
 
+def _dur(us: int) -> str:
+    """Microseconds in whatever unit keeps the digits meaningful.
+
+    Fixed milliseconds hid the small cases entirely: a single call can be
+    a few microseconds, which printed as "0.0m" and looked like a counter
+    that was not working rather than a call that was quick.
+    """
+    if us < 1000:
+        return f"{us}us"
+    if us < 1000000:
+        return f"{us / 1000:.1f}ms"
+    return f"{us / 1000000:.2f}s"
+
+
+def _bytes(n: int) -> str:
+    return f"{n}B" if n < 1024 else f"{n / 1024:.1f}K"
+
+
 def print_stats(rows: list[dict], label: str = ""):
-    """Render the per-instance breakdown as a table."""
+    """Render the per-instance breakdown as a table.
+
+    Instance 0xFF is the node's total for instances that have since been
+    dropped, shown as "gone" — the counters live on the instance, so
+    without it a report taken after the modules were released would be
+    empty.
+    """
     if not rows:
         print(f"{label}no instances resident")
         return
-    print(f"{label}{'inst':>5} {'calls':>6} {'exec':>9} {'compute':>9} "
-          f"{'waiting':>9} {'wait%':>6} {'RPCs':>6} {'tx+rx':>9}")
+    hdr = (f"{'inst':>5} {'calls':>6} {'exec':>9} {'compute':>9} "
+           f"{'waiting':>9} {'wait%':>6} {'RPCs':>6} {'traffic':>8}")
+    print(label + hdr)
+
+    def row(name, r):
+        pct = (100.0 * r["rpc_wait_us"] / r["exec_us"]) if r["exec_us"] else 0.0
+        print(f"{label}{name:>5} {r['calls']:>6} {_dur(r['exec_us']):>9} "
+              f"{_dur(r['compute_us']):>9} {_dur(r['rpc_wait_us']):>9} "
+              f"{pct:>5.1f}% {r['rpc_count']:>6} "
+              f"{_bytes(r['rpc_tx'] + r['rpc_rx']):>8}")
+
     tot = {k: 0 for k in ("calls", "exec_us", "compute_us", "rpc_wait_us",
                           "rpc_count", "rpc_tx", "rpc_rx")}
+    shown = 0
     for r in rows:
-        pct = (100.0 * r["rpc_wait_us"] / r["exec_us"]) if r["exec_us"] else 0.0
-        name = "gone" if r["inst"] == 0xFF else str(r["inst"])
-        print(f"{label}{name:>5} {r['calls']:>6} "
-              f"{r['exec_us'] / 1000:>8.1f}m {r['compute_us'] / 1000:>8.1f}m "
-              f"{r['rpc_wait_us'] / 1000:>8.1f}m {pct:>5.1f}% "
-              f"{r['rpc_count']:>6} {r['rpc_tx'] + r['rpc_rx']:>8}B")
+        # Skip an all-zero "gone" row: it only means nothing has been
+        # dropped yet, and printing it invites reading it as a problem.
+        if r["inst"] == 0xFF and r["calls"] == 0 and r["exec_us"] == 0:
+            continue
+        row("gone" if r["inst"] == 0xFF else str(r["inst"]), r)
+        shown += 1
         for k in tot:
             tot[k] += r[k]
-    if len(rows) > 1:
-        pct = (100.0 * tot["rpc_wait_us"] / tot["exec_us"]) if tot["exec_us"] else 0.0
-        print(f"{label}{'all':>5} {tot['calls']:>6} "
-              f"{tot['exec_us'] / 1000:>8.1f}m {tot['compute_us'] / 1000:>8.1f}m "
-              f"{tot['rpc_wait_us'] / 1000:>8.1f}m {pct:>5.1f}% "
-              f"{tot['rpc_count']:>6} {tot['rpc_tx'] + tot['rpc_rx']:>8}B")
+    if shown > 1:
+        row("all", tot)
+    if tot["rpc_count"]:
+        print(f"{label}{'':>5} {'':>6} per round trip: "
+              f"{_dur(tot['rpc_wait_us'] // tot['rpc_count'])} waiting, "
+              f"{_bytes((tot['rpc_tx'] + tot['rpc_rx']) // tot['rpc_count'])} "
+              f"moved")
 
 
 def cmd_stats(node: WaspNode, args):
