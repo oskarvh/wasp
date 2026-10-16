@@ -375,7 +375,55 @@ python3 tools/wasp_client.py <node-ip> load tools/test_module.wasm
 python3 tools/wasp_client.py <node-ip> call fib 20
 python3 tools/wasp_client.py <node-ip> unload
 python3 tools/wasp_client.py <node-ip> reboot       # remote reboot (any board)
+python3 tools/wasp_client.py <node-ip> reset        # release every module/instance
 ```
+
+### Where the time goes
+
+Nodes count, per instance, how long they spent inside the interpreter
+against how long they spent waiting for the coordinator to answer a
+remote-memory round trip. Host-side wall clock cannot tell those apart,
+which is the whole reason the counters exist on the node.
+
+```sh
+python3 tools/wasp_client.py <node-ip> stats --reset   # zero
+# ...run whatever you want to measure...
+python3 tools/wasp_client.py <node-ip> stats           # read
+
+python3 tools/mandelbrot_demo.py <ips...> --stats      # or let the demo do it
+```
+
+```
+ inst  calls      exec   compute   waiting  wait%   RPCs  traffic
+   16      1   585.3ms   180.6ms   404.7ms  69.1%     34     8.3K
+    1      1   585.3ms   184.8ms   400.4ms  68.4%     34     8.3K
+    2      1   587.7ms   185.0ms   402.7ms  68.5%     34     8.3K
+  all      3     1.76s   550.4ms     1.21s  68.7%    102    24.9K
+             per round trip: 11.8ms waiting, 249B moved
+```
+
+A round trip's wait is accrued *inside* the call that issued it, so
+`compute = exec - waiting` and the split needs no second measurement.
+Instance `gone` is the total for instances since dropped — releasing a
+module would otherwise take its own measurements with it, which makes
+"run a workload, then ask what happened" report nothing.
+
+The per-round-trip line is the one to watch. Rendering the same frame
+with one, two and three instances per node across two boards:
+
+| inst/node | workers | compute/node | wait% | ms per round trip |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 2 | 540 ms | 27.1% | 2.05 |
+| 2 | 4 | 554 ms | 52.9% | 6.24 |
+| 3 | 6 | 555 ms | 68.4% | 11.8 |
+
+Compute per node is conserved, as it must be — same work, same core. But
+the wait per round trip grows roughly linearly with the number of
+concurrent workers, which is the signature of a serialized server rather
+than of the wire: the coordinator services all remote memory behind one
+mutex. That is the current ceiling, not the nodes — wall time is flat at
+0.8 s whether a node runs one instance or three, and the core still sits
+around a third idle at three.
 
 WASM modules for wasp are plain clang output — no SDK required:
 
